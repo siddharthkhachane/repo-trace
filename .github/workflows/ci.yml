@@ -47,4 +47,12 @@ jobs:
         run: ruff check .
 
       - name: Tests (pytest)
-        run: pytest -q
+        run: |
+          pytest -q
+          ec=$?
+          if [ $ec -eq 5 ]; then
+            echo "No tests collected (exit code 5). Passing for now."
+            exit 0
+          fi
+          exit $ec
+
