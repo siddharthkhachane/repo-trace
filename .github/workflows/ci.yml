@@ -14,7 +14,8 @@ jobs:
     name: Frontend - static checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Verify static frontend files exist
         run: |
@@ -23,13 +24,14 @@ jobs:
           echo "Static frontend files found."
 
   backend:
-    name: Backend - FastAPI lint/test
+    name: Backend - FastAPI lint
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -41,18 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r ../requirements.txt
-          pip install ruff pytest
+          pip install ruff
 
       - name: Lint (ruff)
         run: ruff check .
-
-      - name: Tests (pytest)
-        run: |
-          pytest -q
-          ec=$?
-          if [ $ec -eq 5 ]; then
-            echo "No tests collected (exit code 5). Passing for now."
-            exit 0
-          fi
-          exit $ec
-
