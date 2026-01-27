@@ -26,10 +26,12 @@ app.add_middleware(
 DATA_DIR = Path("data")
 STATE_DIR = DATA_DIR / "state"
 REPOS_DIR = DATA_DIR / "repos"
+INDEXES_DIR = DATA_DIR / "indexes"
 
 # Ensure directories exist
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 REPOS_DIR.mkdir(parents=True, exist_ok=True)
+INDEXES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # Models
@@ -104,17 +106,137 @@ async def index_repo(repo_id: str, github_url: str, branch: Optional[str]):
         # Clone repo
         repo = git.Repo.clone_from(github_url, repo_path, branch=branch)
         
-        # Simulate indexing (dummy implementation)
-        commits = list(repo.iter_commits())
-        commits_indexed = len(commits)
+        # Create indexes directory for this repo
+        index_dir = INDEXES_DIR / repo_id
+        index_dir.mkdir(parents=True, exist_ok=True)
+        docs_file = index_dir / "docs.jsonl"
         
-        # Simulate some processing time
-        await asyncio.sleep(2)
+        # Extract commits and diffs (limit to last 2000 commits)
+        commits = list(repo.iter_commits(max_count=2000))
+        commits_indexed = 0
+        chunks = 0
+        
+        with open(docs_file, 'w', encoding='utf-8') as f:
+            for commit in commits:
+                try:
+                    # Extract commit metadata
+                    commit_hash = commit.hexsha
+                    author = commit.author.name if commit.author else "Unknown"
+                    date = commit.committed_datetime.isoformat()
+                    message = commit.message.strip()
+                    
+                    # Write commit message document
+                    commit_doc = {
+                        "id": f"{commit_hash}_msg",
+                        "type": "commit_message",
+                        "text": message,
+                        "meta": {
+                            "commit": commit_hash,
+                            "author": author,
+                            "date": date,
+                            "files": [],
+                            "path": "",
+                            "hunk_header": ""
+                        }
+                    }
+                    f.write(json.dumps(commit_doc, ensure_ascii=False) + '\n')
+                    chunks += 1
+                    
+                    # Extract diff hunks
+                    # Get parent commit for diff
+                    if commit.parents:
+                        parent = commit.parents[0]
+                        diffs = parent.diff(commit, create_patch=True)
+                        
+                        for diff_item in diffs:
+                            try:
+                                # Get file path
+                                file_path = diff_item.b_path if diff_item.b_path else diff_item.a_path
+                                if not file_path:
+                                    continue
+                                
+                                # Get the unified diff
+                                if diff_item.diff:
+                                    diff_text = diff_item.diff.decode('utf-8', errors='replace')
+                                    
+                                    # Split diff into hunks (sections starting with @@)
+                                    lines = diff_text.split('\n')
+                                    current_hunk = []
+                                    hunk_header = ""
+                                    hunk_count = 0
+                                    
+                                    for line in lines:
+                                        if line.startswith('@@'):
+                                            # Save previous hunk if exists
+                                            if current_hunk and hunk_header:
+                                                hunk_text = '\n'.join(current_hunk)
+                                                # Limit context to 3 lines before and after
+                                                if len(hunk_text.strip()) > 0:
+                                                    hunk_doc = {
+                                                        "id": f"{commit_hash}_{file_path}_{hunk_count}",
+                                                        "type": "diff_hunk",
+                                                        "text": hunk_text,
+                                                        "meta": {
+                                                            "commit": commit_hash,
+                                                            "author": author,
+                                                            "date": date,
+                                                            "files": [file_path],
+                                                            "path": file_path,
+                                                            "hunk_header": hunk_header
+                                                        }
+                                                    }
+                                                    f.write(json.dumps(hunk_doc, ensure_ascii=False) + '\n')
+                                                    chunks += 1
+                                                    hunk_count += 1
+                                            
+                                            # Start new hunk
+                                            hunk_header = line
+                                            current_hunk = [line]
+                                        elif current_hunk:
+                                            current_hunk.append(line)
+                                    
+                                    # Save last hunk
+                                    if current_hunk and hunk_header:
+                                        hunk_text = '\n'.join(current_hunk)
+                                        if len(hunk_text.strip()) > 0:
+                                            hunk_doc = {
+                                                "id": f"{commit_hash}_{file_path}_{hunk_count}",
+                                                "type": "diff_hunk",
+                                                "text": hunk_text,
+                                                "meta": {
+                                                    "commit": commit_hash,
+                                                    "author": author,
+                                                    "date": date,
+                                                    "files": [file_path],
+                                                    "path": file_path,
+                                                    "hunk_header": hunk_header
+                                                }
+                                            }
+                                            f.write(json.dumps(hunk_doc, ensure_ascii=False) + '\n')
+                                            chunks += 1
+                                            
+                            except Exception as e:
+                                # Skip individual diff processing errors
+                                print(f"Error processing diff for {file_path}: {e}")
+                                continue
+                    
+                    commits_indexed += 1
+                    
+                    # Update state periodically
+                    if commits_indexed % 100 == 0:
+                        state["commits_indexed"] = commits_indexed
+                        state["chunks"] = chunks
+                        save_state(repo_id, state)
+                        
+                except Exception as e:
+                    # Skip individual commit processing errors
+                    print(f"Error processing commit {commit.hexsha}: {e}")
+                    continue
         
         # Update state to completed
         state["status"] = "completed"
         state["commits_indexed"] = commits_indexed
-        state["chunks"] = commits_indexed * 5  # Dummy calculation
+        state["chunks"] = chunks
         state["completed_at"] = datetime.utcnow().isoformat()
         save_state(repo_id, state)
         
