@@ -2,13 +2,16 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from datetime import datetime
 
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import git
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
 
 # Initialize FastAPI app
 app = FastAPI(title="RepoTrace API")
@@ -32,6 +35,12 @@ INDEXES_DIR = DATA_DIR / "indexes"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 REPOS_DIR.mkdir(parents=True, exist_ok=True)
 INDEXES_DIR.mkdir(parents=True, exist_ok=True)
+
+# Initialize embedding model (using a fast, efficient model)
+print("Loading embedding model...")
+EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+EMBEDDING_DIM = EMBEDDING_MODEL.get_sentence_embedding_dimension()
+print(f"Embedding model loaded. Dimension: {EMBEDDING_DIM}")
 
 
 # Models
@@ -84,6 +93,104 @@ def load_state(repo_id: str) -> dict:
 def save_state(repo_id: str, state: dict):
     state_file = get_state_file(repo_id)
     state_file.write_text(json.dumps(state, indent=2))
+
+
+def build_vector_index(repo_id: str, docs_file: Path) -> Tuple[int, int]:
+    """Build FAISS vector index from docs.jsonl.
+    
+    Args:
+        repo_id: Repository ID
+        docs_file: Path to docs.jsonl file
+        
+    Returns:
+        Tuple of (num_vectors, embedding_dim)
+    """
+    index_dir = INDEXES_DIR / repo_id
+    faiss_index_file = index_dir / "faiss.index"
+    meta_file = index_dir / "meta.jsonl"
+    
+    # Read all documents
+    docs = []
+    with open(docs_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                docs.append(json.loads(line))
+    
+    if not docs:
+        print(f"No documents found in {docs_file}")
+        return 0, EMBEDDING_DIM
+    
+    # Extract texts and metadata
+    texts = [doc['text'] for doc in docs]
+    
+    # Generate embeddings in batches
+    print(f"Generating embeddings for {len(texts)} documents...")
+    embeddings = EMBEDDING_MODEL.encode(
+        texts,
+        batch_size=32,
+        show_progress_bar=True,
+        convert_to_numpy=True
+    )
+    
+    # Build FAISS index
+    print(f"Building FAISS index...")
+    index = faiss.IndexFlatL2(EMBEDDING_DIM)
+    index.add(embeddings.astype('float32'))
+    
+    # Save FAISS index
+    print(f"Saving FAISS index to {faiss_index_file}")
+    faiss.write_index(index, str(faiss_index_file))
+    
+    # Save metadata mapping (vector_id -> doc metadata)
+    print(f"Saving metadata to {meta_file}")
+    with open(meta_file, 'w', encoding='utf-8') as f:
+        for i, doc in enumerate(docs):
+            meta_entry = {
+                "vector_id": i,
+                "doc_id": doc['id'],
+                "type": doc['type'],
+                "meta": doc['meta']
+            }
+            f.write(json.dumps(meta_entry, ensure_ascii=False) + '\n')
+    
+    print(f"Vector index built: {index.ntotal} vectors")
+    return index.ntotal, EMBEDDING_DIM
+
+
+def load_index(repo_id: str) -> Tuple[faiss.Index, list, bool]:
+    """Load FAISS index and metadata for a repository.
+    
+    Args:
+        repo_id: Repository ID
+        
+    Returns:
+        Tuple of (faiss_index, metadata_list, success)
+    """
+    index_dir = INDEXES_DIR / repo_id
+    faiss_index_file = index_dir / "faiss.index"
+    meta_file = index_dir / "meta.jsonl"
+    
+    # Check if files exist
+    if not faiss_index_file.exists() or not meta_file.exists():
+        print(f"Index files not found for repo {repo_id}")
+        return None, None, False
+    
+    try:
+        # Load FAISS index
+        index = faiss.read_index(str(faiss_index_file))
+        
+        # Load metadata
+        metadata = []
+        with open(meta_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                if line.strip():
+                    metadata.append(json.loads(line))
+        
+        print(f"Loaded index for {repo_id}: {index.ntotal} vectors")
+        return index, metadata, True
+    except Exception as e:
+        print(f"Error loading index for {repo_id}: {e}")
+        return None, None, False
 
 
 # Background task for indexing
@@ -233,10 +340,22 @@ async def index_repo(repo_id: str, github_url: str, branch: Optional[str]):
                     print(f"Error processing commit {commit.hexsha}: {e}")
                     continue
         
-        # Update state to completed
-        state["status"] = "completed"
+        # Update state - indexing completed, now building vector index
+        state["status"] = "building_index"
         state["commits_indexed"] = commits_indexed
         state["chunks"] = chunks
+        save_state(repo_id, state)
+        
+        # Build vector index from docs.jsonl
+        print(f"Building vector index for {repo_id}...")
+        num_vectors, embed_dim = build_vector_index(repo_id, docs_file)
+        
+        # Update state to ready (only after vector index is built)
+        state["status"] = "ready"
+        state["commits_indexed"] = commits_indexed
+        state["chunks"] = chunks
+        state["vectors"] = num_vectors
+        state["embedding_dim"] = embed_dim
         state["completed_at"] = datetime.utcnow().isoformat()
         save_state(repo_id, state)
         
