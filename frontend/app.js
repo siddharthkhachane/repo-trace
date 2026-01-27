@@ -81,7 +81,7 @@ async function handleIngest() {
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                repo_url: url,
+                github_url: url,
                 branch: branch
             })
         });
@@ -92,14 +92,15 @@ async function handleIngest() {
         }
 
         const data = await response.json();
-        updateStatusPanel('processing', `Ingestion started. Repo ID: ${repoId}`);
+        currentRepoId = data.repo_id;
+        updateStatusPanel('processing', `Ingestion started. Repo ID: ${data.repo_id}`);
         
         // Start polling status
         clearInterval(statusPollInterval);
-        statusPollInterval = setInterval(() => pollStatus(repoId), 2000);
+        statusPollInterval = setInterval(() => pollStatus(data.repo_id), 2000);
         
         // Initial poll
-        pollStatus(repoId);
+        pollStatus(data.repo_id);
     } catch (error) {
         console.error('Ingest error:', error);
         updateStatusPanel('failed', `Error: ${error.message}`);
@@ -120,20 +121,20 @@ async function pollStatus(repoId) {
 
         const data = await response.json();
         
-        if (data.status === 'ready') {
+        if (data.status === 'completed') {
             clearInterval(statusPollInterval);
             isRepoReady = true;
-            updateStatusPanel('ready', 'Repository ready for querying');
+            updateStatusPanel('ready', `Repository ready for querying (${data.commits_indexed} commits indexed)`);
             questionInput.disabled = false;
             askBtn.disabled = false;
             chatMessages.innerHTML = '<div class="empty-state">Ask a question about the repository.</div>';
-        } else if (data.status === 'failed') {
+        } else if (data.status === 'error') {
             clearInterval(statusPollInterval);
             updateStatusPanel('failed', `Failed: ${data.error || 'Unknown error'}`);
             resetIngestForm();
         } else {
             // Still processing
-            updateStatusPanel('processing', `${data.status || 'Processing'}${data.progress ? ` (${data.progress})` : ''}`);
+            updateStatusPanel('processing', `${data.status || 'Processing'}${data.commits_indexed ? ` (${data.commits_indexed} commits)` : ''}`);
         }
     } catch (error) {
         console.error('Status poll error:', error);
@@ -161,14 +162,14 @@ async function handleAsk() {
     questionInput.disabled = true;
     
     try {
-        const response = await fetch(`${CONFIG.API_BASE}/query`, {
+        const response = await fetch(`${CONFIG.API_BASE}/ask`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify({
-                repo_id: currentRepoId,
-                question: question
+                question: question,
+                repo_id: currentRepoId
             })
         });
 
