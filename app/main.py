@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List, Set
 from datetime import datetime
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -72,6 +72,9 @@ EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 EMBEDDING_DIM = int(EMBEDDING_MODEL.get_sentence_embedding_dimension() or 0)
 
 INDEX_CACHE: Dict[str, Tuple[faiss.Index, List[Dict[str, Any]]]] = {}
+
+app.state.ask_internal_cache = {}
+app.state.ask_internal_cache_max = 200
 
 
 class IngestRequest(BaseModel):
@@ -156,6 +159,7 @@ def build_vector_index(repo_id: str, docs_file: Path) -> Tuple[int, int]:
     index = faiss.IndexFlatL2(EMBEDDING_DIM)
     index.add(embeddings.astype("float32"))  # type: ignore[arg-type]
 
+    index_dir.mkdir(parents=True, exist_ok=True)
     faiss.write_index(index, str(faiss_index_file))
 
     with open(meta_file, "w", encoding="utf-8") as f:
@@ -235,13 +239,152 @@ def format_hunk_snippet(hunk_text: str, max_lines: int = 4) -> str:
     return " | ".join(snippet_lines)
 
 
-def compose_answer_with_gpt(question: str, commit_context: List[Dict[str, Any]]) -> str:
+def commit_message_has_revert_keywords(message: Any) -> bool:
+    if isinstance(message, (bytes, bytearray)):
+        try:
+            text = message.decode("utf-8", errors="replace")
+        except Exception:
+            text = ""
+    else:
+        text = str(message or "")
+    lowered = text.lower()
+    return any(token in lowered for token in ("revert", "rollback", "undo"))
+
+
+def build_commit_file_deltas(commit: git.Commit) -> Dict[str, Dict[str, int]]:
+    if not commit.parents:
+        return {}
+
+    deltas: Dict[str, Dict[str, int]] = {}
+    try:
+        diffs = commit.parents[0].diff(commit, create_patch=True)
+    except Exception:
+        return deltas
+
+    for diff_item in diffs:
+        file_path = diff_item.b_path if diff_item.b_path else diff_item.a_path
+        if not file_path:
+            continue
+
+        patch = diff_item.diff
+        if not patch:
+            continue
+
+        if isinstance(patch, (bytes, bytearray)):
+            diff_text = patch.decode("utf-8", errors="replace")
+        else:
+            diff_text = str(patch)
+
+        added = 0
+        removed = 0
+        for line in diff_text.splitlines():
+            if not line:
+                continue
+            if line.startswith(("+++", "---", "@@")):
+                continue
+            if line.startswith("+"):
+                added += 1
+            elif line.startswith("-"):
+                removed += 1
+
+        if added == 0 and removed == 0:
+            continue
+
+        entry = deltas.setdefault(file_path, {"added": 0, "removed": 0, "net": 0})
+        entry["added"] += added
+        entry["removed"] += removed
+        entry["net"] += added - removed
+
+    return deltas
+
+
+def detect_history_attempts(repo_id: str, top_commits: List[str]) -> Dict[str, Any]:
+    history_attempts: Dict[str, Any] = {"revert_pairs": [], "revert_markers": []}
+    repo_path = REPOS_DIR / repo_id
+    if not repo_path.exists():
+        return history_attempts
+
+    try:
+        repo = git.Repo(repo_path)
+        commits = list(repo.iter_commits())
+    except Exception:
+        return history_attempts
+
+    if not commits:
+        return history_attempts
+
+    index_by_hash = {c.hexsha: i for i, c in enumerate(commits)}
+    deltas_cache: Dict[str, Dict[str, Dict[str, int]]] = {}
+    markers: Set[str] = set()
+    pairs: Set[Tuple[str, str]] = set()
+
+    def get_deltas(commit_obj: git.Commit) -> Dict[str, Dict[str, int]]:
+        cached = deltas_cache.get(commit_obj.hexsha)
+        if cached is not None:
+            return cached
+        deltas = build_commit_file_deltas(commit_obj)
+        deltas_cache[commit_obj.hexsha] = deltas
+        return deltas
+
+    def opposite_direction(net_a: int, net_b: int) -> bool:
+        if net_a == 0 or net_b == 0:
+            return False
+        return (net_a > 0 and net_b < 0) or (net_a < 0 and net_b > 0)
+
+    for attempt_hash in top_commits:
+        idx = index_by_hash.get(attempt_hash)
+        if idx is None:
+            continue
+
+        attempt_commit = commits[idx]
+        if commit_message_has_revert_keywords(attempt_commit.message):
+            markers.add(attempt_hash)
+
+        attempt_deltas = get_deltas(attempt_commit)
+        if not attempt_deltas:
+            continue
+
+        window_start = max(0, idx - 50)
+        later_commits = commits[window_start:idx]
+
+        for later_commit in later_commits:
+            if commit_message_has_revert_keywords(later_commit.message):
+                markers.add(later_commit.hexsha)
+
+            later_deltas = get_deltas(later_commit)
+            if not later_deltas:
+                continue
+
+            for file_path, delta in attempt_deltas.items():
+                later_delta = later_deltas.get(file_path)
+                if not later_delta:
+                    continue
+                if opposite_direction(int(delta.get("net", 0)), int(later_delta.get("net", 0))):
+                    pairs.add((attempt_hash, later_commit.hexsha))
+                    break
+            else:
+                continue
+            break
+
+    history_attempts["revert_pairs"] = [
+        {"attempt": attempt, "reverted_by": reverted_by} for attempt, reverted_by in sorted(pairs)
+    ]
+    history_attempts["revert_markers"] = sorted(markers)
+    return history_attempts
+
+
+def compose_answer_with_gpt(
+    question: str,
+    commit_context: List[Dict[str, Any]],
+    history_attempts: Optional[Dict[str, Any]] = None,
+) -> str:
     if _openai_client is None:
         return ""
 
     payload = {
         "question": question,
         "top_commits": commit_context,
+        "history_attempts": history_attempts or {"revert_pairs": [], "revert_markers": []},
         "requirements": [
             "Explain likely reason using commit messages and diff context",
             "Mention who and when",
@@ -264,7 +407,10 @@ def compose_answer_with_gpt(question: str, commit_context: List[Dict[str, Any]])
         return ""
 
 
-def build_deterministic_answer(commit_context: List[Dict[str, Any]]) -> str:
+def build_deterministic_answer(
+    commit_context: List[Dict[str, Any]],
+    history_attempts: Optional[Dict[str, Any]] = None,
+) -> str:
     lines: List[str] = ["Likely reason (from commit messages and diff context):"]
     for c in commit_context:
         commit = str(c.get("commit") or "")
@@ -280,7 +426,30 @@ def build_deterministic_answer(commit_context: List[Dict[str, Any]]) -> str:
         if diffs:
             lines.append(f"  Diff context: {' || '.join(diffs)}")
 
+    if history_attempts:
+        pairs = history_attempts.get("revert_pairs") or []
+        if pairs:
+            lines.append("Potential revert activity:")
+            for pair in pairs:
+                attempt = str(pair.get("attempt") or "")
+                reverted_by = str(pair.get("reverted_by") or "")
+                if attempt and reverted_by:
+                    lines.append(f"- {attempt[:7]} reverted by {reverted_by[:7]}")
+
     return "\n".join(lines).strip()
+
+
+def store_ask_internal(trace_id: str, payload: Dict[str, Any]) -> None:
+    cache: Dict[str, Any] = app.state.ask_internal_cache
+    cache[trace_id] = payload
+    max_size = int(app.state.ask_internal_cache_max or 200)
+    if len(cache) > max_size:
+        try:
+            to_drop = list(cache.keys())[: max(1, len(cache) - max_size)]
+            for k in to_drop:
+                cache.pop(k, None)
+        except Exception:
+            pass
 
 
 async def index_repo(repo_id: str, github_url: str, branch: Optional[str]):
@@ -476,18 +645,39 @@ def get_status(repo_id: str):
 
 
 @app.post("/ask", response_model=AskResponse)
-def ask(request: AskRequest):
+def ask(request: AskRequest, http_request: Request):
+    trace_id = str(uuid.uuid4())
     try:
         repo_id = request.repo_id
         question = request.question
 
         if not repo_id:
+            store_ask_internal(
+                trace_id,
+                {
+                    "trace_id": trace_id,
+                    "repo_id": repo_id,
+                    "question": question,
+                    "error": "missing_repo_id",
+                    "history_attempts": {"revert_pairs": [], "revert_markers": []},
+                },
+            )
             return AskResponse(
                 answer="Missing repo_id. Please provide a valid repo_id from /ingest.",
                 citations=[],
             )
 
         if not question or not question.strip():
+            store_ask_internal(
+                trace_id,
+                {
+                    "trace_id": trace_id,
+                    "repo_id": repo_id,
+                    "question": question,
+                    "error": "missing_question",
+                    "history_attempts": {"revert_pairs": [], "revert_markers": []},
+                },
+            )
             return AskResponse(
                 answer="Missing question. Please provide a non-empty question.",
                 citations=[],
@@ -499,6 +689,16 @@ def ask(request: AskRequest):
         else:
             index, metadata, ok = load_index(repo_id)
             if not ok or index is None or metadata is None:
+                store_ask_internal(
+                    trace_id,
+                    {
+                        "trace_id": trace_id,
+                        "repo_id": repo_id,
+                        "question": question,
+                        "error": "index_not_found",
+                        "history_attempts": {"revert_pairs": [], "revert_markers": []},
+                    },
+                )
                 return AskResponse(
                     answer=(
                         f"No index found for repo_id '{repo_id}'. "
@@ -509,6 +709,16 @@ def ask(request: AskRequest):
             INDEX_CACHE[repo_id] = (index, metadata)
 
         if int(index.ntotal) == 0:
+            store_ask_internal(
+                trace_id,
+                {
+                    "trace_id": trace_id,
+                    "repo_id": repo_id,
+                    "question": question,
+                    "error": "empty_index",
+                    "history_attempts": {"revert_pairs": [], "revert_markers": []},
+                },
+            )
             return AskResponse(
                 answer=f"Index for repo_id '{repo_id}' is empty. Try re-ingesting the repository.",
                 citations=[],
@@ -546,6 +756,16 @@ def ask(request: AskRequest):
             )
 
         if not results:
+            store_ask_internal(
+                trace_id,
+                {
+                    "trace_id": trace_id,
+                    "repo_id": repo_id,
+                    "question": question,
+                    "error": "no_results",
+                    "history_attempts": {"revert_pairs": [], "revert_markers": []},
+                },
+            )
             return AskResponse(answer="No relevant commits found for this question.", citations=[])
 
         index_dir = INDEXES_DIR / repo_id
@@ -578,6 +798,16 @@ def ask(request: AskRequest):
                     entry["files"].add(str(file_path))
 
         if not commits:
+            store_ask_internal(
+                trace_id,
+                {
+                    "trace_id": trace_id,
+                    "repo_id": repo_id,
+                    "question": question,
+                    "error": "no_commits",
+                    "history_attempts": {"revert_pairs": [], "revert_markers": []},
+                },
+            )
             return AskResponse(answer="No relevant commits found for this question.", citations=[])
 
         top_commits = sorted(commits.items(), key=lambda item: float(item[1]["best_distance"]))[:3]
@@ -622,13 +852,40 @@ def ask(request: AskRequest):
             )
             citations.append(Citation(commit=commit, author=author, date=date, files=files))
 
-        answer = compose_answer_with_gpt(question, commit_context)
+        history_attempts = detect_history_attempts(
+            repo_id,
+            [str(c.get("commit") or "") for c in commit_context if c.get("commit")],
+        )
+
+        answer = compose_answer_with_gpt(question, commit_context, history_attempts)
         if not answer:
-            answer = build_deterministic_answer(commit_context)
+            answer = build_deterministic_answer(commit_context, history_attempts)
+
+        ask_internal = {
+            "trace_id": trace_id,
+            "repo_id": repo_id,
+            "question": question,
+            "commit_context": commit_context,
+            "history_attempts": history_attempts,
+            "answer": answer,
+            "citations": [c.model_dump() for c in citations],
+        }
+        store_ask_internal(trace_id, ask_internal)
+        http_request.state.ask_internal = ask_internal
 
         return AskResponse(answer=answer, citations=citations)
 
     except Exception as e:
+        store_ask_internal(
+            trace_id,
+            {
+                "trace_id": trace_id,
+                "repo_id": getattr(request, "repo_id", None),
+                "question": getattr(request, "question", None),
+                "error": f"{type(e).__name__}: {e}",
+                "history_attempts": {"revert_pairs": [], "revert_markers": []},
+            },
+        )
         return AskResponse(
             answer=(
                 "I couldn't answer due to an internal error while querying the repo index. "
