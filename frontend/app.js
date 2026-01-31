@@ -173,7 +173,16 @@ function addChatMessage(role, content, citations = null) {
 
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
-  bubble.textContent = content;
+  
+  // Preserve line breaks and basic formatting
+  bubble.innerHTML = content
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br>')
+    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.*?)\*/g, '<em>$1</em>');
+  
   messageDiv.appendChild(bubble);
 
   if (Array.isArray(citations) && citations.length > 0) {
