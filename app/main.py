@@ -6,6 +6,7 @@ from typing import Optional, Tuple, Dict, Any, List, Set
 from datetime import datetime
 
 from fastapi import FastAPI, BackgroundTasks, Request
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -468,6 +469,40 @@ def compose_answer_with_gpt(
         return (resp.choices[0].message.content or "").strip()
     except Exception:
         return ""
+
+
+def stream_answer_with_gpt(
+    question: str,
+    commit_context: List[Dict[str, Any]],
+    history_attempts: Optional[Dict[str, Any]] = None,
+):
+    if _openai_client is None:
+        return None
+
+    payload = {
+        "question": question,
+        "top_commits": commit_context,
+        "history_attempts": history_attempts or {"revert_pairs": [], "revert_markers": []},
+        "requirements": [
+            "Explain likely reason using commit messages and diff context",
+            "Mention who and when",
+            "Mention files affected",
+            "Do not invent details not present in provided context",
+        ],
+    }
+
+    try:
+        return _openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You summarize relevant git commits and diffs to answer questions."},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.2,
+            stream=True,
+        )
+    except Exception:
+        return None
 
 
 def build_deterministic_answer(
@@ -1030,3 +1065,259 @@ def ask(request: AskRequest, http_request: Request):
             citations=[],
             referenced_files=[],
         )
+
+
+@app.get("/ask")
+async def ask_stream(request: Request, repo_id: Optional[str] = None, question: Optional[str] = None):
+    trace_id = str(uuid.uuid4())
+    CACHE_STATS["total_requests"] += 1
+
+    async def event_generator():
+        def sse(payload: Dict[str, Any]) -> str:
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        try:
+            if not repo_id:
+                CACHE_STATS["misses"] += 1
+                yield sse({"type": "error", "message": "Missing repo_id. Please provide a valid repo_id from /ingest."})
+                return
+
+            if not question or not question.strip():
+                CACHE_STATS["misses"] += 1
+                yield sse({"type": "error", "message": "Missing question. Please provide a non-empty question."})
+                return
+
+            cache_key = get_cache_key(repo_id, question)
+            cached_response = get_cached_response(cache_key)
+            if cached_response:
+                CACHE_STATS["hits"] += 1
+                for word in str(cached_response.get("answer", "")).split():
+                    if await request.is_disconnected():
+                        return
+                    yield sse({"type": "token", "content": word + " "})
+                yield sse(
+                    {
+                        "type": "done",
+                        "answer": cached_response.get("answer", ""),
+                        "citations": cached_response.get("citations", []),
+                        "referenced_files": cached_response.get("referenced_files", []),
+                    }
+                )
+                return
+
+            CACHE_STATS["misses"] += 1
+
+            cached = INDEX_CACHE.get(repo_id)
+            if cached:
+                index, metadata = cached
+            else:
+                index, metadata, ok = load_index(repo_id)
+                if not ok or index is None or metadata is None:
+                    yield sse({"type": "error", "message": f"No index found for repo_id '{repo_id}'. Please run /ingest and wait for indexing to complete."})
+                    return
+                INDEX_CACHE[repo_id] = (index, metadata)
+
+            if int(index.ntotal) == 0:
+                yield sse({"type": "error", "message": f"Index for repo_id '{repo_id}' is empty. Try re-ingesting the repository."})
+                return
+
+            query_vec = EMBEDDING_MODEL.encode([question], convert_to_numpy=True)[0]
+            top_k = 10
+
+            distances, indices = index.search(query_vec.reshape(1, -1).astype("float32"), top_k)  # type: ignore[call-arg]
+
+            meta_by_vector: Dict[int, Dict[str, Any]] = {}
+            for m in metadata:
+                vid_raw = m.get("vector_id")
+                if vid_raw is None:
+                    continue
+                try:
+                    vid = int(vid_raw)
+                except Exception:
+                    continue
+                meta_by_vector[vid] = m
+
+            results: List[Dict[str, Any]] = []
+            for dist, idx in zip(distances[0], indices[0]):
+                if int(idx) == -1:
+                    continue
+                meta_entry = meta_by_vector.get(int(idx))
+                if not meta_entry:
+                    continue
+                results.append(
+                    {
+                        "distance": float(dist),
+                        "doc_id": meta_entry.get("doc_id"),
+                        "type": meta_entry.get("type"),
+                        "meta": meta_entry.get("meta", {}) or {},
+                    }
+                )
+
+            if not results:
+                yield sse({"type": "error", "message": "No relevant commits found for this question."})
+                return
+
+            index_dir = INDEXES_DIR / repo_id
+            docs_file = index_dir / "docs.jsonl"
+            doc_ids: Set[str] = {str(r["doc_id"]) for r in results if r.get("doc_id") is not None}
+            docs_by_id = load_docs_by_id(docs_file, doc_ids)
+
+            commits: Dict[str, Dict[str, Any]] = {}
+            for r in results:
+                meta = r.get("meta") or {}
+                commit = meta.get("commit")
+                if not isinstance(commit, str) or not commit:
+                    continue
+
+                entry = commits.setdefault(
+                    commit,
+                    {
+                        "best_distance": float(r["distance"]),
+                        "results": [],
+                        "author": meta.get("author", "Unknown"),
+                        "date": meta.get("date", ""),
+                        "files": set(),
+                    },
+                )
+                entry["best_distance"] = min(float(entry["best_distance"]), float(r["distance"]))
+                entry["results"].append(r)
+
+                for file_path in (meta.get("files") or []):
+                    if file_path:
+                        entry["files"].add(str(file_path))
+
+            if not commits:
+                yield sse({"type": "error", "message": "No relevant commits found for this question."})
+                return
+
+            top_commits = sorted(commits.items(), key=lambda item: float(item[1]["best_distance"]))[:3]
+
+            commit_context: List[Dict[str, Any]] = []
+            citations: List[Citation] = []
+            file_references: Dict[str, Dict[str, Any]] = {}
+
+            for commit, data in top_commits:
+                author = str(data.get("author", "Unknown"))
+                date = str(data.get("date", ""))
+                files = sorted(list(data.get("files", set())))
+
+                for file_path in files:
+                    if file_path not in file_references:
+                        file_references[file_path] = {
+                            "relevance_score": 1.0 - float(data["best_distance"]),
+                            "line_numbers": [],
+                            "preview_snippet": None,
+                        }
+                    else:
+                        file_references[file_path]["relevance_score"] = max(
+                            file_references[file_path]["relevance_score"],
+                            1.0 - float(data["best_distance"])
+                        )
+
+                commit_message = ""
+                hunk_snippets: List[str] = []
+
+                for r in data["results"]:
+                    doc_id = r.get("doc_id")
+                    if doc_id is None:
+                        continue
+                    doc = docs_by_id.get(str(doc_id), {}) or {}
+                    rtype = r.get("type")
+
+                    if rtype == "commit_message" and not commit_message:
+                        commit_message = str(doc.get("text") or "").strip()
+                    elif rtype == "diff_hunk" and len(hunk_snippets) < 2:
+                        snippet = format_hunk_snippet(str(doc.get("text") or ""))
+                        if snippet:
+                            hunk_snippets.append(snippet)
+
+                if not commit_message:
+                    commit_message = "No commit message available."
+
+                commit_context.append(
+                    {
+                        "commit": commit,
+                        "author": author,
+                        "date": date,
+                        "files": files,
+                        "commit_message": commit_message,
+                        "diff_context": hunk_snippets,
+                    }
+                )
+                citations.append(Citation(commit=commit, author=author, date=date, files=files))
+
+            referenced_files_list = [
+                FileReference(
+                    file_path=file_path,
+                    relevance_score=round(data["relevance_score"], 3),
+                    line_numbers=data.get("line_numbers", []),
+                    preview_snippet=data.get("preview_snippet"),
+                )
+                for file_path, data in file_references.items()
+            ]
+            referenced_files_list.sort(key=lambda x: x.relevance_score, reverse=True)
+            referenced_files_list = referenced_files_list[:5]
+
+            history_attempts = detect_history_attempts(
+                repo_id,
+                [str(c.get("commit") or "") for c in commit_context if c.get("commit")],
+            )
+
+            answer_parts: List[str] = []
+            stream = stream_answer_with_gpt(question, commit_context, history_attempts)
+            if stream is not None:
+                for event in stream:
+                    if await request.is_disconnected():
+                        return
+                    delta = event.choices[0].delta.content if event.choices else None
+                    if not delta:
+                        continue
+                    answer_parts.append(delta)
+                    yield sse({"type": "token", "content": delta})
+
+            answer = "".join(answer_parts).strip()
+            if not answer:
+                answer = build_deterministic_answer(commit_context, history_attempts)
+                for word in answer.split():
+                    if await request.is_disconnected():
+                        return
+                    yield sse({"type": "token", "content": word + " "})
+
+            ask_internal = {
+                "trace_id": trace_id,
+                "repo_id": repo_id,
+                "question": question,
+                "commit_context": commit_context,
+                "history_attempts": history_attempts,
+                "answer": answer,
+                "citations": [c.model_dump() for c in citations],
+                "referenced_files": [f.model_dump() for f in referenced_files_list],
+            }
+            store_ask_internal(trace_id, ask_internal)
+
+            set_cached_response(
+                cache_key,
+                repo_id,
+                question,
+                answer,
+                [c.model_dump() for c in citations],
+                [f.model_dump() for f in referenced_files_list],
+            )
+
+            yield sse(
+                {
+                    "type": "done",
+                    "answer": answer,
+                    "citations": [c.model_dump() for c in citations],
+                    "referenced_files": [f.model_dump() for f in referenced_files_list],
+                }
+            )
+
+        except Exception as e:
+            yield sse({"type": "error", "message": f"I couldn't answer due to an internal error. Details: {type(e).__name__}: {e}"})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )

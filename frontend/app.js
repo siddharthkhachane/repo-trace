@@ -13,10 +13,19 @@ const statusPanel = document.getElementById('statusPanel');
 const chatMessages = document.getElementById('chatMessages');
 const questionInput = document.getElementById('questionInput');
 const askBtn = document.getElementById('askBtn');
+const stopBtn = document.getElementById('stopBtn');
 const themeToggle = document.getElementById('themeToggle');
+
+let currentEventSource = null;
+let typewriterTimer = null;
+let typewriterQueue = '';
+let streamingBubble = null;
+let streamingMessageDiv = null;
+let streamingAnswer = '';
 
 ingestBtn.addEventListener('click', handleIngest);
 askBtn.addEventListener('click', handleAsk);
+stopBtn.addEventListener('click', stopStreaming);
 themeToggle.addEventListener('click', toggleTheme);
 questionInput.addEventListener('keypress', (e) => {
   if (e.key === 'Enter' && e.ctrlKey && !askBtn.disabled) {
@@ -148,29 +157,224 @@ async function handleAsk() {
 
   askBtn.disabled = true;
   questionInput.disabled = true;
+  stopBtn.disabled = false;
 
   try {
-    const response = await fetch(`${CONFIG.API_BASE}/ask`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, repo_id: currentRepoId })
-    });
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ message: response.statusText }));
-      throw new Error(error.message || `HTTP ${response.status}`);
-    }
-
-    const data = await response.json();
-    addChatMessage('assistant', data.answer, data.citations, data.referenced_files);
+    startStreamingMessage();
+    startEventStream(question);
   } catch (error) {
     console.error('Query error:', error);
     addChatMessage('assistant', `Error: ${error.message}`);
+    stopStreaming();
   } finally {
-    askBtn.disabled = false;
-    questionInput.disabled = false;
-    questionInput.focus();
+    // Re-enable handled on stream end
   }
+}
+
+function startEventStream(question) {
+  if (currentEventSource) {
+    currentEventSource.close();
+  }
+
+  streamingAnswer = '';
+
+  const url = `${CONFIG.API_BASE}/ask?repo_id=${encodeURIComponent(currentRepoId)}&question=${encodeURIComponent(question)}`;
+  currentEventSource = new EventSource(url);
+
+  currentEventSource.onmessage = (event) => {
+    if (!event.data) return;
+    let payload = null;
+    try {
+      payload = JSON.parse(event.data);
+    } catch (e) {
+      return;
+    }
+
+    if (payload.type === 'token') {
+      streamingAnswer += payload.content || '';
+      queueTypewriter(payload.content || '');
+    } else if (payload.type === 'done') {
+      finishStreaming(payload.answer || streamingAnswer, payload.citations || [], payload.referenced_files || []);
+    } else if (payload.type === 'error') {
+      queueTypewriter(`\n${payload.message || 'Error'}\n`);
+      finishStreaming(streamingAnswer + `\n${payload.message || 'Error'}`, [], []);
+    }
+  };
+
+  currentEventSource.onerror = () => {
+    finishStreaming(streamingAnswer || 'Error: stream disconnected', [], []);
+  };
+}
+
+function startStreamingMessage() {
+  const chatContainer = chatMessages;
+  const emptyState = chatContainer.querySelector('.empty-state');
+  if (emptyState) emptyState.remove();
+
+  streamingMessageDiv = document.createElement('div');
+  streamingMessageDiv.className = 'message assistant';
+
+  streamingBubble = document.createElement('div');
+  streamingBubble.className = 'message-bubble';
+  streamingBubble.textContent = '';
+
+  streamingMessageDiv.appendChild(streamingBubble);
+  chatContainer.appendChild(streamingMessageDiv);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function queueTypewriter(text) {
+  if (!text) return;
+  typewriterQueue += text;
+  if (typewriterTimer) return;
+
+  typewriterTimer = setInterval(() => {
+    if (!typewriterQueue.length) {
+      clearInterval(typewriterTimer);
+      typewriterTimer = null;
+      return;
+    }
+    const nextChar = typewriterQueue.charAt(0);
+    typewriterQueue = typewriterQueue.slice(1);
+    if (streamingBubble) {
+      streamingBubble.textContent += nextChar;
+    }
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }, 12);
+}
+
+function flushTypewriter() {
+  if (streamingBubble && typewriterQueue.length) {
+    streamingBubble.textContent += typewriterQueue;
+  }
+  typewriterQueue = '';
+  if (typewriterTimer) {
+    clearInterval(typewriterTimer);
+    typewriterTimer = null;
+  }
+}
+
+function finishStreaming(finalAnswer, citations, referencedFiles) {
+  if (currentEventSource) {
+    currentEventSource.close();
+    currentEventSource = null;
+  }
+
+  flushTypewriter();
+
+  if (streamingBubble) {
+    const processedContent = processMarkdownContent(finalAnswer || '');
+    streamingBubble.innerHTML = processedContent;
+  }
+
+  if (streamingMessageDiv) {
+    if (Array.isArray(citations) && citations.length > 0) {
+      const citationsDiv = document.createElement('div');
+      citationsDiv.className = 'citations';
+      citationsDiv.innerHTML = '<strong>Sources:</strong>';
+
+      citations.forEach((c) => {
+        const pill = document.createElement('span');
+        pill.className = 'citation-link';
+
+        const commit = (c.commit || '').slice(0, 7);
+        const author = c.author || 'Unknown';
+        const date = c.date || '';
+        const files = Array.isArray(c.files) && c.files.length
+          ? ` • ${c.files.slice(0, 3).join(', ')}${c.files.length > 3 ? '…' : ''}`
+          : '';
+
+        pill.textContent = `${commit} • ${author} • ${date}${files}`;
+        citationsDiv.appendChild(pill);
+      });
+
+      streamingMessageDiv.appendChild(citationsDiv);
+    }
+
+    if (Array.isArray(referencedFiles) && referencedFiles.length > 0) {
+      const filesSidebar = document.createElement('div');
+      filesSidebar.className = 'referenced-files-sidebar';
+      
+      const toggleBtn = document.createElement('button');
+      toggleBtn.className = 'files-toggle-btn';
+      toggleBtn.innerHTML = '📁 Referenced Files <span class="toggle-icon">▼</span>';
+      toggleBtn.onclick = () => {
+        const content = filesSidebar.querySelector('.files-content');
+        const icon = filesSidebar.querySelector('.toggle-icon');
+        if (content.style.display === 'none') {
+          content.style.display = 'block';
+          icon.textContent = '▼';
+        } else {
+          content.style.display = 'none';
+          icon.textContent = '▶';
+        }
+      };
+      
+      const filesContent = document.createElement('div');
+      filesContent.className = 'files-content';
+      
+      referencedFiles.forEach((file) => {
+        const fileItem = document.createElement('div');
+        fileItem.className = 'file-item';
+        
+        const fileHeader = document.createElement('div');
+        fileHeader.className = 'file-header';
+        
+        const fileName = document.createElement('span');
+        fileName.className = 'file-name';
+        fileName.textContent = file.file_path.split('/').pop();
+        
+        const relevance = document.createElement('span');
+        relevance.className = 'file-relevance';
+        relevance.textContent = `${(file.relevance_score * 100).toFixed(1)}%`;
+        
+        fileHeader.appendChild(fileName);
+        fileHeader.appendChild(relevance);
+        
+        const filePath = document.createElement('div');
+        filePath.className = 'file-path';
+        filePath.textContent = file.file_path;
+        
+        fileItem.appendChild(fileHeader);
+        fileItem.appendChild(filePath);
+        
+        if (currentRepoId) {
+          const githubLink = document.createElement('a');
+          githubLink.className = 'github-link';
+          githubLink.href = `https://github.com/${currentRepoId}/blob/main/${file.file_path}`;
+          githubLink.target = '_blank';
+          githubLink.textContent = 'View on GitHub';
+          fileItem.appendChild(githubLink);
+        }
+        
+        filesContent.appendChild(fileItem);
+      });
+      
+      filesSidebar.appendChild(toggleBtn);
+      filesSidebar.appendChild(filesContent);
+      streamingMessageDiv.appendChild(filesSidebar);
+    }
+
+    streamingMessageDiv.querySelectorAll('pre code').forEach((block) => {
+      Prism.highlightElement(block);
+    });
+  }
+
+  streamingBubble = null;
+  streamingMessageDiv = null;
+
+  askBtn.disabled = false;
+  questionInput.disabled = false;
+  stopBtn.disabled = true;
+  questionInput.focus();
+}
+
+function stopStreaming() {
+  if (currentEventSource) {
+    currentEventSource.close();
+    currentEventSource = null;
+  }
+  finishStreaming(streamingAnswer || 'Stopped.', [], []);
 }
 
 function processMarkdownContent(content) {

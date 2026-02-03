@@ -550,6 +550,22 @@
             padding: 12px 24px;
         }
 
+        .stop-btn {
+            background: rgba(239, 68, 68, 0.12);
+            border: 1px solid rgba(239, 68, 68, 0.35);
+            color: #fca5a5;
+        }
+
+        .stop-btn:hover {
+            background: rgba(239, 68, 68, 0.2);
+            border-color: rgba(239, 68, 68, 0.5);
+        }
+
+        .stop-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
         #questionInput {
             resize: none;
             min-height: 52px;
@@ -954,6 +970,9 @@
                         ></textarea>
                         <button id="askBtn" disabled>
                             Send →
+                        </button>
+                        <button id="stopBtn" class="stop-btn" disabled>
+                            Stop
                         </button>
                     </div>
                 </div>
