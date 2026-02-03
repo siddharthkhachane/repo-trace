@@ -13,9 +13,11 @@ const statusPanel = document.getElementById('statusPanel');
 const chatMessages = document.getElementById('chatMessages');
 const questionInput = document.getElementById('questionInput');
 const askBtn = document.getElementById('askBtn');
+const themeToggle = document.getElementById('themeToggle');
 
 ingestBtn.addEventListener('click', handleIngest);
 askBtn.addEventListener('click', handleAsk);
+themeToggle.addEventListener('click', toggleTheme);
 questionInput.addEventListener('keypress', (e) => {
   if (e.key === 'Enter' && e.ctrlKey && !askBtn.disabled) {
     handleAsk();
@@ -104,7 +106,11 @@ async function pollStatus(repoId) {
       clearInterval(statusPollInterval);
       isRepoReady = true;
 
-      updateStatusPanel('ready', `Repository ready for querying (${data.commits_indexed} commits indexed)`);
+      updateStatusPanel('ready', `Repository ready for querying (${data.commits_indexed} commits indexed)`, {
+        cache_hits: data.cache_hits || 0,
+        cache_misses: data.cache_misses || 0,
+        cache_hit_rate: data.cache_hit_rate || 0
+      });
 
       questionInput.disabled = false;
       askBtn.disabled = false;
@@ -117,7 +123,12 @@ async function pollStatus(repoId) {
     } else {
       updateStatusPanel(
         'processing',
-        `${data.status || 'Processing'}${data.commits_indexed ? ` (${data.commits_indexed} commits)` : ''}`
+        `${data.status || 'Processing'}${data.commits_indexed ? ` (${data.commits_indexed} commits)` : ''}`,
+        data.cache_hits !== undefined ? {
+          cache_hits: data.cache_hits,
+          cache_misses: data.cache_misses,
+          cache_hit_rate: data.cache_hit_rate
+        } : null
       );
     }
   } catch (error) {
@@ -151,7 +162,7 @@ async function handleAsk() {
     }
 
     const data = await response.json();
-    addChatMessage('assistant', data.answer, data.citations);
+    addChatMessage('assistant', data.answer, data.citations, data.referenced_files);
   } catch (error) {
     console.error('Query error:', error);
     addChatMessage('assistant', `Error: ${error.message}`);
@@ -218,7 +229,7 @@ function copyCode(button) {
   });
 }
 
-function addChatMessage(role, content, citations = null) {
+function addChatMessage(role, content, citations = null, referencedFiles = null) {
   const chatContainer = chatMessages;
 
   const emptyState = chatContainer.querySelector('.empty-state');
@@ -259,6 +270,72 @@ function addChatMessage(role, content, citations = null) {
     messageDiv.appendChild(citationsDiv);
   }
 
+  // Add referenced files sidebar if available
+  if (Array.isArray(referencedFiles) && referencedFiles.length > 0) {
+    const filesSidebar = document.createElement('div');
+    filesSidebar.className = 'referenced-files-sidebar';
+    
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'files-toggle-btn';
+    toggleBtn.innerHTML = '📁 Referenced Files <span class="toggle-icon">▼</span>';
+    toggleBtn.onclick = () => {
+      const content = filesSidebar.querySelector('.files-content');
+      const icon = filesSidebar.querySelector('.toggle-icon');
+      if (content.style.display === 'none') {
+        content.style.display = 'block';
+        icon.textContent = '▼';
+      } else {
+        content.style.display = 'none';
+        icon.textContent = '▶';
+      }
+    };
+    
+    const filesContent = document.createElement('div');
+    filesContent.className = 'files-content';
+    
+    referencedFiles.forEach((file) => {
+      const fileItem = document.createElement('div');
+      fileItem.className = 'file-item';
+      
+      const fileHeader = document.createElement('div');
+      fileHeader.className = 'file-header';
+      
+      const fileName = document.createElement('span');
+      fileName.className = 'file-name';
+      fileName.textContent = file.file_path.split('/').pop();
+      
+      const relevance = document.createElement('span');
+      relevance.className = 'file-relevance';
+      relevance.textContent = `${(file.relevance_score * 100).toFixed(1)}%`;
+      
+      fileHeader.appendChild(fileName);
+      fileHeader.appendChild(relevance);
+      
+      const filePath = document.createElement('div');
+      filePath.className = 'file-path';
+      filePath.textContent = file.file_path;
+      
+      fileItem.appendChild(fileHeader);
+      fileItem.appendChild(filePath);
+      
+      // Add GitHub link if we have repo info
+      if (currentRepoId) {
+        const githubLink = document.createElement('a');
+        githubLink.className = 'github-link';
+        githubLink.href = `https://github.com/${currentRepoId}/blob/main/${file.file_path}`;
+        githubLink.target = '_blank';
+        githubLink.textContent = 'View on GitHub';
+        fileItem.appendChild(githubLink);
+      }
+      
+      filesContent.appendChild(fileItem);
+    });
+    
+    filesSidebar.appendChild(toggleBtn);
+    filesSidebar.appendChild(filesContent);
+    messageDiv.appendChild(filesSidebar);
+  }
+
   chatContainer.appendChild(messageDiv);
   chatContainer.scrollTop = chatContainer.scrollHeight;
   
@@ -268,7 +345,7 @@ function addChatMessage(role, content, citations = null) {
   });
 }
 
-function updateStatusPanel(status, message) {
+function updateStatusPanel(status, message, cacheStats = null) {
   let statusClass = '';
   let icon = '';
 
@@ -287,6 +364,16 @@ function updateStatusPanel(status, message) {
       break;
   }
 
+  let cacheHtml = '';
+  if (cacheStats && (cacheStats.cache_hits > 0 || cacheStats.cache_misses > 0)) {
+    cacheHtml = `
+      <div class="status-item">
+        <span class="status-label">🗄️ Cache:</span>
+        <span class="status-value">${cacheStats.cache_hit_rate}% hit rate (${cacheStats.cache_hits} hits, ${cacheStats.cache_misses} misses)</span>
+      </div>
+    `;
+  }
+
   statusPanel.innerHTML = `
     <div class="status-item">
       <span class="status-label">${icon} Status:</span>
@@ -296,6 +383,7 @@ function updateStatusPanel(status, message) {
       <span class="status-label">Repo ID:</span>
       <span class="status-value">${currentRepoId || 'None'}</span>
     </div>
+    ${cacheHtml}
   `;
 }
 
@@ -317,5 +405,33 @@ function resetIngestForm() {
   currentRepoId = null;
   isRepoReady = false;
 }
+
+// Theme toggle functionality
+function toggleTheme() {
+  const currentTheme = document.documentElement.getAttribute('data-theme');
+  const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+  
+  setTheme(newTheme);
+}
+
+function setTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  localStorage.setItem('theme', theme);
+  
+  // Update theme icon
+  const themeIcon = document.querySelector('.theme-icon');
+  if (themeIcon) {
+    themeIcon.textContent = theme === 'light' ? '☀️' : '🌙';
+  }
+}
+
+// Initialize theme on page load
+function initTheme() {
+  const savedTheme = localStorage.getItem('theme') || 'dark';
+  setTheme(savedTheme);
+}
+
+// Initialize theme when DOM is loaded
+document.addEventListener('DOMContentLoaded', initTheme);
 
 console.log(`Repo-Trace frontend initialized. API Base: ${CONFIG.API_BASE}`);
