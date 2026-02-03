@@ -819,7 +819,12 @@ def ask(request: AskRequest, http_request: Request):
                 citations=[],
                 referenced_files=[],
             )
-        distances, indices = index.search(query_vec, top_k)  # type: ignore[call-arg]
+        
+        # Create query vector from question
+        query_vec = EMBEDDING_MODEL.encode([question], convert_to_numpy=True)[0]
+        top_k = 10
+        
+        distances, indices = index.search(query_vec.reshape(1, -1).astype("float32"), top_k)  # type: ignore[call-arg]
 
         meta_by_vector: Dict[int, Dict[str, Any]] = {}
         for m in metadata:
