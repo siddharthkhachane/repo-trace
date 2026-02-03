@@ -110,13 +110,14 @@ def get_cached_response(cache_key: str) -> Optional[Dict[str, Any]]:
     return cached_item
 
 
-def set_cached_response(cache_key: str, repo_id: str, question: str, answer: str, citations: List[Dict[str, Any]]):
+def set_cached_response(cache_key: str, repo_id: str, question: str, answer: str, citations: List[Dict[str, Any]], referenced_files: Optional[List[Dict[str, Any]]] = None):
     """Store response in cache."""
     QA_CACHE[cache_key] = {
         "repo_id": repo_id,
         "question": question,
         "answer": answer,
         "citations": citations,
+        "referenced_files": referenced_files or [],
         "timestamp": datetime.utcnow().timestamp()
     }
 
@@ -161,9 +162,17 @@ class Citation(BaseModel):
     files: list[str]
 
 
+class FileReference(BaseModel):
+    file_path: str
+    relevance_score: float
+    line_numbers: Optional[list[int]] = None
+    preview_snippet: Optional[str] = None
+
+
 class AskResponse(BaseModel):
     answer: str
     citations: list[Citation]
+    referenced_files: list[FileReference]
 
 
 def get_state_file(repo_id: str) -> Path:
@@ -731,6 +740,7 @@ def ask(request: AskRequest, http_request: Request):
             return AskResponse(
                 answer="Missing repo_id. Please provide a valid repo_id from /ingest.",
                 citations=[],
+                referenced_files=[],
             )
 
         if not question or not question.strip():
@@ -748,6 +758,7 @@ def ask(request: AskRequest, http_request: Request):
             return AskResponse(
                 answer="Missing question. Please provide a non-empty question.",
                 citations=[],
+                referenced_files=[],
             )
 
         # Check cache first
@@ -757,9 +768,11 @@ def ask(request: AskRequest, http_request: Request):
             CACHE_STATS["hits"] += 1
             # Return cached response
             citations = [Citation(**c) for c in cached_response["citations"]]
+            referenced_files = [FileReference(**f) for f in cached_response.get("referenced_files", [])]
             return AskResponse(
                 answer=cached_response["answer"],
                 citations=citations,
+                referenced_files=referenced_files,
             )
 
         CACHE_STATS["misses"] += 1
@@ -786,6 +799,7 @@ def ask(request: AskRequest, http_request: Request):
                         "Please run /ingest and wait for indexing to complete."
                     ),
                     citations=[],
+                    referenced_files=[],
                 )
             INDEX_CACHE[repo_id] = (index, metadata)
 
@@ -803,10 +817,8 @@ def ask(request: AskRequest, http_request: Request):
             return AskResponse(
                 answer=f"Index for repo_id '{repo_id}' is empty. Try re-ingesting the repository.",
                 citations=[],
+                referenced_files=[],
             )
-
-        query_vec = EMBEDDING_MODEL.encode([question], convert_to_numpy=True).astype("float32")
-        top_k = min(8, int(index.ntotal))
         distances, indices = index.search(query_vec, top_k)  # type: ignore[call-arg]
 
         meta_by_vector: Dict[int, Dict[str, Any]] = {}
@@ -847,7 +859,7 @@ def ask(request: AskRequest, http_request: Request):
                     "history_attempts": {"revert_pairs": [], "revert_markers": []},
                 },
             )
-            return AskResponse(answer="No relevant commits found for this question.", citations=[])
+            return AskResponse(answer="No relevant commits found for this question.", citations=[], referenced_files=[])
 
         index_dir = INDEXES_DIR / repo_id
         docs_file = index_dir / "docs.jsonl"
@@ -889,17 +901,33 @@ def ask(request: AskRequest, http_request: Request):
                     "history_attempts": {"revert_pairs": [], "revert_markers": []},
                 },
             )
-            return AskResponse(answer="No relevant commits found for this question.", citations=[])
+            return AskResponse(answer="No relevant commits found for this question.", citations=[], referenced_files=[])
 
         top_commits = sorted(commits.items(), key=lambda item: float(item[1]["best_distance"]))[:3]
 
         commit_context: List[Dict[str, Any]] = []
         citations: List[Citation] = []
+        file_references: Dict[str, Dict[str, Any]] = {}
 
         for commit, data in top_commits:
             author = str(data.get("author", "Unknown"))
             date = str(data.get("date", ""))
             files = sorted(list(data.get("files", set())))
+
+            # Track file references with relevance scores
+            for file_path in files:
+                if file_path not in file_references:
+                    file_references[file_path] = {
+                        "relevance_score": 1.0 - float(data["best_distance"]),  # Convert distance to relevance (higher is better)
+                        "line_numbers": [],
+                        "preview_snippet": None
+                    }
+                else:
+                    # Update relevance score (take the maximum)
+                    file_references[file_path]["relevance_score"] = max(
+                        file_references[file_path]["relevance_score"],
+                        1.0 - float(data["best_distance"])
+                    )
 
             commit_message = ""
             hunk_snippets: List[str] = []
@@ -933,6 +961,20 @@ def ask(request: AskRequest, http_request: Request):
             )
             citations.append(Citation(commit=commit, author=author, date=date, files=files))
 
+        # Convert file references to list and sort by relevance
+        referenced_files_list = [
+            FileReference(
+                file_path=file_path,
+                relevance_score=round(data["relevance_score"], 3),
+                line_numbers=data.get("line_numbers", []),
+                preview_snippet=data.get("preview_snippet")
+            )
+            for file_path, data in file_references.items()
+        ]
+        referenced_files_list.sort(key=lambda x: x.relevance_score, reverse=True)
+        # Limit to top 5 files
+        referenced_files_list = referenced_files_list[:5]
+
         history_attempts = detect_history_attempts(
             repo_id,
             [str(c.get("commit") or "") for c in commit_context if c.get("commit")],
@@ -950,14 +992,19 @@ def ask(request: AskRequest, http_request: Request):
             "history_attempts": history_attempts,
             "answer": answer,
             "citations": [c.model_dump() for c in citations],
+            "referenced_files": [f.model_dump() for f in referenced_files_list],
         }
         store_ask_internal(trace_id, ask_internal)
         http_request.state.ask_internal = ask_internal
 
         # Cache the response
-        set_cached_response(cache_key, repo_id, question, answer, [c.model_dump() for c in citations])
+        set_cached_response(cache_key, repo_id, question, answer, [c.model_dump() for c in citations], [f.model_dump() for f in referenced_files_list])
 
-        return AskResponse(answer=answer, citations=citations)
+        return AskResponse(
+            answer=answer,
+            citations=citations,
+            referenced_files=referenced_files_list
+        )
 
     except Exception as e:
         store_ask_internal(
@@ -976,4 +1023,5 @@ def ask(request: AskRequest, http_request: Request):
                 f"Details: {type(e).__name__}: {e}"
             ),
             citations=[],
+            referenced_files=[],
         )
