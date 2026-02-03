@@ -5,6 +5,7 @@ const CONFIG = {
 let currentRepoId = null;
 let statusPollInterval = null;
 let isRepoReady = false;
+let currentRepoStats = null;
 
 const repoUrlInput = document.getElementById('repoUrl');
 const branchInput = document.getElementById('branchInput');
@@ -125,9 +126,11 @@ async function pollStatus(repoId) {
       askBtn.disabled = false;
 
       chatMessages.innerHTML = '<div class="empty-state">Ask a question about the repository.</div>';
+      fetchRepoStats(repoId);
     } else if (data.status === 'error') {
       clearInterval(statusPollInterval);
       updateStatusPanel('failed', `Failed: ${data.error || 'Unknown error'}`);
+      renderRepoStats(null);
       resetIngestForm();
     } else {
       updateStatusPanel(
@@ -139,11 +142,88 @@ async function pollStatus(repoId) {
           cache_hit_rate: data.cache_hit_rate
         } : null
       );
+      renderRepoStats(null);
     }
   } catch (error) {
     console.error('Status poll error:', error);
     updateStatusPanel('failed', 'Status check failed');
+    renderRepoStats(null);
   }
+}
+
+async function fetchRepoStats(repoId) {
+  try {
+    const response = await fetch(`${CONFIG.API_BASE}/api/repo-stats?repo_id=${encodeURIComponent(repoId)}`);
+    const data = await response.json();
+    if (!response.ok || data.error) {
+      return;
+    }
+    currentRepoStats = data;
+    renderRepoStats(currentRepoStats);
+  } catch (error) {
+    console.error('Stats fetch error:', error);
+  }
+}
+
+function renderRepoStats(stats) {
+  const existing = statusPanel.querySelector('.repo-stats');
+  if (existing) existing.remove();
+  if (!stats) return;
+
+  const totalFiles = Number(stats.total_files || 0);
+  const totalLoc = Number(stats.total_loc || 0);
+  const languages = Array.isArray(stats.language_breakdown) ? stats.language_breakdown.slice(0, 6) : [];
+  const fileTypes = Array.isArray(stats.file_type_distribution) ? stats.file_type_distribution.slice(0, 6) : [];
+
+  const statsDiv = document.createElement('div');
+  statsDiv.className = 'repo-stats';
+
+  statsDiv.innerHTML = `
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-label">Total Files</div>
+        <div class="stat-value">${totalFiles.toLocaleString()}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Lines of Code</div>
+        <div class="stat-value">${totalLoc.toLocaleString()}</div>
+      </div>
+    </div>
+
+    <div class="stats-section">
+      <div class="stats-title">Languages</div>
+      ${languages.map((l, i) => {
+        const color = `hsl(${(i * 50) % 360}, 70%, 60%)`;
+        return `
+          <div class="bar-row">
+            <div class="bar-label">${l.language}</div>
+            <div class="bar-track">
+              <div class="bar-fill" style="width: ${l.percent || 0}%; background: ${color};"></div>
+            </div>
+            <div class="bar-value">${(l.percent || 0)}%</div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+
+    <div class="stats-section">
+      <div class="stats-title">File Types</div>
+      ${fileTypes.map((f, i) => {
+        const color = `hsl(${(i * 50 + 120) % 360}, 70%, 60%)`;
+        return `
+          <div class="bar-row">
+            <div class="bar-label">${f.ext}</div>
+            <div class="bar-track">
+              <div class="bar-fill" style="width: ${Math.min(100, (f.count / totalFiles) * 100 || 0)}%; background: ${color};"></div>
+            </div>
+            <div class="bar-value">${f.count}</div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+
+  statusPanel.appendChild(statsDiv);
 }
 
 async function handleAsk() {

@@ -550,6 +550,99 @@ def store_ask_internal(trace_id: str, payload: Dict[str, Any]) -> None:
             pass
 
 
+def _language_from_extension(ext: str) -> str:
+    ext = ext.lower()
+    mapping = {
+        ".py": "Python",
+        ".js": "JavaScript",
+        ".ts": "TypeScript",
+        ".tsx": "TypeScript",
+        ".jsx": "JavaScript",
+        ".java": "Java",
+        ".go": "Go",
+        ".rs": "Rust",
+        ".rb": "Ruby",
+        ".php": "PHP",
+        ".cs": "C#",
+        ".cpp": "C++",
+        ".cc": "C++",
+        ".cxx": "C++",
+        ".c": "C",
+        ".h": "C/C++",
+        ".hpp": "C++",
+        ".html": "HTML",
+        ".css": "CSS",
+        ".scss": "CSS",
+        ".md": "Markdown",
+        ".json": "JSON",
+        ".yml": "YAML",
+        ".yaml": "YAML",
+        ".sh": "Shell",
+        ".ps1": "PowerShell",
+        ".sql": "SQL",
+    }
+    return mapping.get(ext, "Other")
+
+
+def analyze_repo_stats(repo_path: Path) -> Dict[str, Any]:
+    skip_dirs = {
+        ".git",
+        ".hg",
+        ".svn",
+        "node_modules",
+        "dist",
+        "build",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".idea",
+        ".vscode",
+    }
+
+    total_files = 0
+    total_loc = 0
+    lang_loc: Dict[str, int] = {}
+    file_types: Dict[str, int] = {}
+
+    for path in repo_path.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in skip_dirs for part in path.parts):
+            continue
+
+        total_files += 1
+        ext = path.suffix.lower() if path.suffix else "(no_ext)"
+        file_types[ext] = file_types.get(ext, 0) + 1
+
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        loc = len(text.splitlines())
+        total_loc += loc
+        lang = _language_from_extension(path.suffix)
+        lang_loc[lang] = lang_loc.get(lang, 0) + loc
+
+    language_breakdown = []
+    for lang, loc in sorted(lang_loc.items(), key=lambda i: i[1], reverse=True):
+        percent = (loc / total_loc * 100) if total_loc else 0.0
+        language_breakdown.append({"language": lang, "loc": loc, "percent": round(percent, 1)})
+
+    file_type_distribution = []
+    for ext, count in sorted(file_types.items(), key=lambda i: i[1], reverse=True):
+        file_type_distribution.append({"ext": ext, "count": count})
+
+    return {
+        "total_files": total_files,
+        "total_loc": total_loc,
+        "language_breakdown": language_breakdown,
+        "file_type_distribution": file_type_distribution,
+    }
+
+
 async def index_repo(repo_id: str, github_url: str, branch: Optional[str]):
     try:
         state = load_state(repo_id) or {"repo_id": repo_id}
@@ -564,6 +657,13 @@ async def index_repo(repo_id: str, github_url: str, branch: Optional[str]):
             shutil.rmtree(repo_path)
 
         repo = git.Repo.clone_from(github_url, repo_path, branch=branch)
+
+        try:
+            state["repo_stats"] = analyze_repo_stats(repo_path)
+            state["repo_stats_at"] = datetime.utcnow().isoformat()
+            save_state(repo_id, state)
+        except Exception:
+            pass
 
         index_dir = INDEXES_DIR / repo_id
         index_dir.mkdir(parents=True, exist_ok=True)
@@ -749,6 +849,17 @@ def get_status(repo_id: str):
         cache_misses=CACHE_STATS["misses"],
         cache_hit_rate=round(hit_rate, 1),
     )
+
+
+@app.get("/api/repo-stats")
+def get_repo_stats(repo_id: str):
+    state = load_state(repo_id)
+    if not state:
+        return {"error": "Repository not found"}
+    stats = state.get("repo_stats")
+    if not stats:
+        return {"error": "Stats not available yet"}
+    return stats
 
 
 @app.post("/ask", response_model=AskResponse)
