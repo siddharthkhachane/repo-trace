@@ -104,7 +104,11 @@ async function pollStatus(repoId) {
       clearInterval(statusPollInterval);
       isRepoReady = true;
 
-      updateStatusPanel('ready', `Repository ready for querying (${data.commits_indexed} commits indexed)`);
+      updateStatusPanel('ready', `Repository ready for querying (${data.commits_indexed} commits indexed)`, {
+        cache_hits: data.cache_hits || 0,
+        cache_misses: data.cache_misses || 0,
+        cache_hit_rate: data.cache_hit_rate || 0
+      });
 
       questionInput.disabled = false;
       askBtn.disabled = false;
@@ -117,7 +121,12 @@ async function pollStatus(repoId) {
     } else {
       updateStatusPanel(
         'processing',
-        `${data.status || 'Processing'}${data.commits_indexed ? ` (${data.commits_indexed} commits)` : ''}`
+        `${data.status || 'Processing'}${data.commits_indexed ? ` (${data.commits_indexed} commits)` : ''}`,
+        data.cache_hits !== undefined ? {
+          cache_hits: data.cache_hits,
+          cache_misses: data.cache_misses,
+          cache_hit_rate: data.cache_hit_rate
+        } : null
       );
     }
   } catch (error) {
@@ -268,7 +277,7 @@ function addChatMessage(role, content, citations = null) {
   });
 }
 
-function updateStatusPanel(status, message) {
+function updateStatusPanel(status, message, cacheStats = null) {
   let statusClass = '';
   let icon = '';
 
@@ -287,6 +296,16 @@ function updateStatusPanel(status, message) {
       break;
   }
 
+  let cacheHtml = '';
+  if (cacheStats && (cacheStats.cache_hits > 0 || cacheStats.cache_misses > 0)) {
+    cacheHtml = `
+      <div class="status-item">
+        <span class="status-label">🗄️ Cache:</span>
+        <span class="status-value">${cacheStats.cache_hit_rate}% hit rate (${cacheStats.cache_hits} hits, ${cacheStats.cache_misses} misses)</span>
+      </div>
+    `;
+  }
+
   statusPanel.innerHTML = `
     <div class="status-item">
       <span class="status-label">${icon} Status:</span>
@@ -296,6 +315,7 @@ function updateStatusPanel(status, message) {
       <span class="status-label">Repo ID:</span>
       <span class="status-value">${currentRepoId || 'None'}</span>
     </div>
+    ${cacheHtml}
   `;
 }
 

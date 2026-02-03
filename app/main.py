@@ -76,6 +76,57 @@ INDEX_CACHE: Dict[str, Tuple[faiss.Index, List[Dict[str, Any]]]] = {}
 app.state.ask_internal_cache = {}
 app.state.ask_internal_cache_max = 200
 
+# Q&A Caching
+QA_CACHE: Dict[str, Dict[str, Any]] = {}
+CACHE_STATS = {
+    "hits": 0,
+    "misses": 0,
+    "total_requests": 0
+}
+CACHE_TTL_HOURS = 24
+
+
+def get_cache_key(repo_id: str, question: str) -> str:
+    """Generate a cache key from repo_id and question."""
+    import hashlib
+    key_data = f"{repo_id}:{question.strip().lower()}"
+    return hashlib.sha256(key_data.encode()).hexdigest()
+
+
+def get_cached_response(cache_key: str) -> Optional[Dict[str, Any]]:
+    """Get cached response if it exists and hasn't expired."""
+    if cache_key not in QA_CACHE:
+        return None
+
+    cached_item = QA_CACHE[cache_key]
+    cached_time = cached_item.get("timestamp", 0)
+    current_time = datetime.utcnow().timestamp()
+
+    # Check if cache has expired (24 hours)
+    if current_time - cached_time > (CACHE_TTL_HOURS * 3600):
+        del QA_CACHE[cache_key]  # Remove expired cache
+        return None
+
+    return cached_item
+
+
+def set_cached_response(cache_key: str, repo_id: str, question: str, answer: str, citations: List[Dict[str, Any]]):
+    """Store response in cache."""
+    QA_CACHE[cache_key] = {
+        "repo_id": repo_id,
+        "question": question,
+        "answer": answer,
+        "citations": citations,
+        "timestamp": datetime.utcnow().timestamp()
+    }
+
+    # Clean up old cache entries if cache gets too large
+    if len(QA_CACHE) > 1000:  # Arbitrary limit
+        # Remove oldest entries
+        sorted_keys = sorted(QA_CACHE.keys(), key=lambda k: QA_CACHE[k]["timestamp"])
+        for old_key in sorted_keys[:100]:  # Remove 10% oldest
+            del QA_CACHE[old_key]
+
 
 class IngestRequest(BaseModel):
     github_url: str
@@ -93,6 +144,9 @@ class StatusResponse(BaseModel):
     commits_indexed: int
     chunks: int
     error: Optional[str] = None
+    cache_hits: int = 0
+    cache_misses: int = 0
+    cache_hit_rate: float = 0.0
 
 
 class AskRequest(BaseModel):
@@ -633,7 +687,13 @@ def get_status(repo_id: str):
             commits_indexed=0,
             chunks=0,
             error="Repository not found",
+            cache_hits=CACHE_STATS["hits"],
+            cache_misses=CACHE_STATS["misses"],
+            cache_hit_rate=0.0,
         )
+
+    total_requests = CACHE_STATS["total_requests"]
+    hit_rate = (CACHE_STATS["hits"] / total_requests * 100) if total_requests > 0 else 0.0
 
     return StatusResponse(
         repo_id=str(state.get("repo_id", repo_id)),
@@ -641,17 +701,23 @@ def get_status(repo_id: str):
         commits_indexed=int(state.get("commits_indexed", 0) or 0),
         chunks=int(state.get("chunks", 0) or 0),
         error=state.get("error"),
+        cache_hits=CACHE_STATS["hits"],
+        cache_misses=CACHE_STATS["misses"],
+        cache_hit_rate=round(hit_rate, 1),
     )
 
 
 @app.post("/ask", response_model=AskResponse)
 def ask(request: AskRequest, http_request: Request):
     trace_id = str(uuid.uuid4())
+    CACHE_STATS["total_requests"] += 1
+
     try:
         repo_id = request.repo_id
         question = request.question
 
         if not repo_id:
+            CACHE_STATS["misses"] += 1
             store_ask_internal(
                 trace_id,
                 {
@@ -668,6 +734,7 @@ def ask(request: AskRequest, http_request: Request):
             )
 
         if not question or not question.strip():
+            CACHE_STATS["misses"] += 1
             store_ask_internal(
                 trace_id,
                 {
@@ -682,6 +749,20 @@ def ask(request: AskRequest, http_request: Request):
                 answer="Missing question. Please provide a non-empty question.",
                 citations=[],
             )
+
+        # Check cache first
+        cache_key = get_cache_key(repo_id, question)
+        cached_response = get_cached_response(cache_key)
+        if cached_response:
+            CACHE_STATS["hits"] += 1
+            # Return cached response
+            citations = [Citation(**c) for c in cached_response["citations"]]
+            return AskResponse(
+                answer=cached_response["answer"],
+                citations=citations,
+            )
+
+        CACHE_STATS["misses"] += 1
 
         cached = INDEX_CACHE.get(repo_id)
         if cached:
@@ -872,6 +953,9 @@ def ask(request: AskRequest, http_request: Request):
         }
         store_ask_internal(trace_id, ask_internal)
         http_request.state.ask_internal = ask_internal
+
+        # Cache the response
+        set_cached_response(cache_key, repo_id, question, answer, [c.model_dump() for c in citations])
 
         return AskResponse(answer=answer, citations=citations)
 
