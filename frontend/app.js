@@ -162,6 +162,62 @@ async function handleAsk() {
   }
 }
 
+function processMarkdownContent(content) {
+  // First escape HTML entities
+  let processed = content
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // Process code blocks ```language\ncode\n```
+  processed = processed.replace(/```(\w+)?\n?([\s\S]*?)```/g, (match, language, code) => {
+    const lang = language || 'plaintext';
+    const langDisplay = language ? language.charAt(0).toUpperCase() + language.slice(1) : 'Code';
+    
+    return `<div class="code-block">
+      <div class="code-header">
+        <span>${langDisplay}</span>
+        <button class="copy-btn" onclick="copyCode(this)">Copy</button>
+      </div>
+      <div class="code-content">
+        <pre><code class="language-${lang}">${code.trim()}</code></pre>
+      </div>
+    </div>`;
+  });
+
+  // Process inline code `code`
+  processed = processed.replace(/`([^`\n]+)`/g, '<code style="background: rgba(0,0,0,0.2); padding: 2px 4px; border-radius: 3px; font-family: monospace;">$1</code>');
+
+  // Process other markdown
+  processed = processed
+    .replace(/\n/g, '<br>')
+    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.*?)\*/g, '<em>$1</em>');
+
+  return processed;
+}
+
+function copyCode(button) {
+  const codeBlock = button.closest('.code-block');
+  const codeElement = codeBlock.querySelector('code');
+  const code = codeElement.textContent;
+  
+  navigator.clipboard.writeText(code).then(() => {
+    button.textContent = 'Copied!';
+    button.classList.add('copied');
+    setTimeout(() => {
+      button.textContent = 'Copy';
+      button.classList.remove('copied');
+    }, 2000);
+  }).catch(err => {
+    console.error('Failed to copy code:', err);
+    button.textContent = 'Error';
+    setTimeout(() => {
+      button.textContent = 'Copy';
+    }, 2000);
+  });
+}
+
 function addChatMessage(role, content, citations = null) {
   const chatContainer = chatMessages;
 
@@ -174,14 +230,9 @@ function addChatMessage(role, content, citations = null) {
   const bubble = document.createElement('div');
   bubble.className = 'message-bubble';
   
-  // Preserve line breaks and basic formatting
-  bubble.innerHTML = content
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\n/g, '<br>')
-    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.*?)\*/g, '<em>$1</em>');
+  // Process content with markdown code blocks
+  const processedContent = processMarkdownContent(content);
+  bubble.innerHTML = processedContent;
   
   messageDiv.appendChild(bubble);
 
@@ -210,6 +261,11 @@ function addChatMessage(role, content, citations = null) {
 
   chatContainer.appendChild(messageDiv);
   chatContainer.scrollTop = chatContainer.scrollHeight;
+  
+  // Apply syntax highlighting to any code blocks
+  messageDiv.querySelectorAll('pre code').forEach((block) => {
+    Prism.highlightElement(block);
+  });
 }
 
 function updateStatusPanel(status, message) {
