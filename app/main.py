@@ -288,19 +288,36 @@ def load_docs_by_id(docs_file: Path, needed_ids: Set[str]) -> Dict[str, Dict[str
     return docs
 
 
-def format_hunk_snippet(hunk_text: str, max_lines: int = 4) -> str:
+def format_hunk_snippet(hunk_text: str, max_lines: int = 6) -> str:
+    """Format diff hunk with better context and cleaner presentation."""
     if not hunk_text:
         return ""
-    lines = [line for line in hunk_text.splitlines() if line.strip()]
+    lines = hunk_text.splitlines()
     if not lines:
         return ""
-    header = lines[0] if lines[0].startswith("@@") else ""
-    body_lines = lines[1:] if header else lines
-    snippet_lines: List[str] = []
-    if header:
-        snippet_lines.append(header)
-    snippet_lines.extend(body_lines[:max_lines])
-    return " | ".join(snippet_lines)
+    
+    # Extract meaningful code lines (skip header and empty lines)
+    code_lines: List[str] = []
+    
+    for line in lines:
+        # Skip hunk headers like @@ -1,5 +1,5 @@
+        if line.startswith("@@"):
+            continue
+        # Skip empty lines
+        if not line.strip():
+            continue
+        # Truncate very long lines to prevent overflow
+        if len(line) > 80:
+            line = line[:77] + "..."
+        code_lines.append(line)
+        if len(code_lines) >= max_lines:
+            break
+    
+    if not code_lines:
+        return ""
+    
+    # Return formatted snippet
+    return "\n".join(code_lines)
 
 
 def commit_message_has_revert_keywords(message: Any) -> bool:
@@ -445,23 +462,49 @@ def compose_answer_with_gpt(
     if _openai_client is None:
         return ""
 
+    # Enhanced structured prompt for better formatting
+    system_prompt = """You are an expert code analyst helping developers understand repository changes.
+
+Provide structured, professional responses in this format:
+
+## Summary
+[1-2 sentence overview answering the question directly]
+
+## Detailed Explanation
+[Clear analysis using the commit messages and diff context provided]
+- Use bullet points for multiple points
+- Use **bold** for important terms
+- Use `code` for file names and functions
+
+## Key Changes
+- **Author**: [who made the change]
+- **When**: [date]
+- **Files**: [list affected files]
+- **Changes**: [brief description]
+
+If code snippets from diff_context are relevant, include them briefly:
+```
+[2-4 key lines from the diff]
+```
+
+Guidelines:
+- Base answers ONLY on provided commit messages and diff context
+- Keep code snippets short and relevant (2-4 lines max)
+- Use clear headings and formatting
+- Be concise and direct
+- Never invent details not in the provided context"""
+
     payload = {
         "question": question,
         "top_commits": commit_context,
         "history_attempts": history_attempts or {"revert_pairs": [], "revert_markers": []},
-        "requirements": [
-            "Explain likely reason using commit messages and diff context",
-            "Mention who and when",
-            "Mention files affected",
-            "Do not invent details not present in provided context",
-        ],
     }
 
     try:
         resp = _openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You summarize relevant git commits and diffs to answer questions."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             temperature=0.2,
@@ -479,23 +522,49 @@ def stream_answer_with_gpt(
     if _openai_client is None:
         return None
 
+    # Enhanced structured prompt for better formatting
+    system_prompt = """You are an expert code analyst helping developers understand repository changes.
+
+Provide structured, professional responses in this format:
+
+## Summary
+[1-2 sentence overview answering the question directly]
+
+## Detailed Explanation
+[Clear analysis using the commit messages and diff context provided]
+- Use bullet points for multiple points
+- Use **bold** for important terms
+- Use `code` for file names and functions
+
+## Key Changes
+- **Author**: [who made the change]
+- **When**: [date]
+- **Files**: [list affected files]
+- **Changes**: [brief description]
+
+If code snippets from diff_context are relevant, include them briefly:
+```
+[2-4 key lines from the diff]
+```
+
+Guidelines:
+- Base answers ONLY on provided commit messages and diff context
+- Keep code snippets short and relevant (2-4 lines max)
+- Use clear headings and formatting
+- Be concise and direct
+- Never invent details not in the provided context"""
+
     payload = {
         "question": question,
         "top_commits": commit_context,
         "history_attempts": history_attempts or {"revert_pairs": [], "revert_markers": []},
-        "requirements": [
-            "Explain likely reason using commit messages and diff context",
-            "Mention who and when",
-            "Mention files affected",
-            "Do not invent details not present in provided context",
-        ],
     }
 
     try:
         return _openai_client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You summarize relevant git commits and diffs to answer questions."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             temperature=0.2,
@@ -505,12 +574,43 @@ def stream_answer_with_gpt(
         return None
 
 
+def post_process_answer(answer: str) -> str:
+    """Post-process AI response for better formatting and readability."""
+    if not answer:
+        return answer
+    
+    # Ensure proper spacing around headings
+    processed = answer
+    import re
+    
+    # Add spacing before markdown headings if missing
+    processed = re.sub(r'([^\n])\n(#{1,3} )', r'\1\n\n\2', processed)
+    
+    # Ensure code blocks have proper spacing
+    processed = re.sub(r'([^\n])\n(```)', r'\1\n\n\2', processed)
+    processed = re.sub(r'(```)\n([^\n])', r'\1\n\n\2', processed)
+    
+    # Enhance key terms visibility (already bolded terms stay bolded)
+    # This is handled by the LLM now with better prompts
+    
+    return processed.strip()
+
+
 def build_deterministic_answer(
     commit_context: List[Dict[str, Any]],
     history_attempts: Optional[Dict[str, Any]] = None,
 ) -> str:
-    lines: List[str] = ["Likely reason (from commit messages and diff context):"]
-    for c in commit_context:
+    """Build structured deterministic answer with improved formatting."""
+    lines: List[str] = []
+    
+    # Add summary section
+    lines.append("## Summary")
+    lines.append(f"Found {len(commit_context)} relevant commit(s) related to your question.\n")
+    
+    # Add detailed explanation section
+    lines.append("## Detailed Explanation\n")
+    
+    for i, c in enumerate(commit_context, 1):
         commit = str(c.get("commit") or "")
         author = str(c.get("author") or "Unknown")
         date = str(c.get("date") or "")
@@ -518,21 +618,36 @@ def build_deterministic_answer(
         files = c.get("files") or []
         diffs = c.get("diff_context") or []
 
-        lines.append(f"- {commit[:7]} by {author} on {date}: {msg}")
+        lines.append(f"**Commit {i}**: `{commit[:7]}`")
+        lines.append(f"- **Message**: {msg}")
+        lines.append(f"- **Author**: {author}")
+        lines.append(f"- **Date**: {date}")
+        
         if files:
-            lines.append(f"  Files affected: {', '.join(files)}")
+            # Limit file display to prevent overflow
+            file_list = files[:5]
+            file_str = ', '.join(f'`{f}`' for f in file_list)
+            if len(files) > 5:
+                file_str += f' ...and {len(files) - 5} more'
+            lines.append(f"- **Files**: {file_str}")
+        
+        # Show brief code context if available (simplified)
         if diffs:
-            lines.append(f"  Diff context: {' || '.join(diffs)}")
+            lines.append(f"- **Code changes**: {len(diffs)} diff section(s) modified")
+        
+        lines.append("")  # Empty line between commits
 
+    # Add revert information if present
     if history_attempts:
         pairs = history_attempts.get("revert_pairs") or []
         if pairs:
-            lines.append("Potential revert activity:")
+            lines.append("## Revert Activity\n")
             for pair in pairs:
                 attempt = str(pair.get("attempt") or "")
                 reverted_by = str(pair.get("reverted_by") or "")
                 if attempt and reverted_by:
-                    lines.append(f"- {attempt[:7]} reverted by {reverted_by[:7]}")
+                    lines.append(f"- Commit `{attempt[:7]}` was reverted by `{reverted_by[:7]}`")
+            lines.append("")  # Empty line
 
     return "\n".join(lines).strip()
 
@@ -1393,6 +1508,9 @@ async def ask_stream(request: Request, repo_id: Optional[str] = None, question: 
                     if await request.is_disconnected():
                         return
                     yield sse({"type": "token", "content": word + " "})
+            
+            # Apply post-processing for better formatting
+            answer = post_process_answer(answer)
 
             ask_internal = {
                 "trace_id": trace_id,
