@@ -961,6 +961,37 @@
             transition: transform 0.3s ease;
         }
 
+        .export-chat-btn {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 8px 14px;
+            cursor: pointer;
+            color: var(--text-primary);
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+        }
+
+        .export-chat-btn:hover {
+            background: var(--bg-hover);
+            border-color: var(--accent-color);
+            transform: translateY(-1px);
+        }
+
+        .export-chat-btn:active {
+            transform: translateY(0);
+        }
+
+        .export-chat-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
         [data-theme="light"] .theme-icon {
             content: "☀️";
         }
@@ -980,6 +1011,9 @@
                 <div class="header-actions">
                     <button id="themeToggle" class="theme-toggle-btn" title="Toggle theme">
                         <span class="theme-icon">🌙</span>
+                    </button>
+                    <button id="exportChatBtn" class="export-chat-btn" title="Export chat history">
+                        📄 Export Chat
                     </button>
                     <div class="status-badge">
                         <span class="status-dot"></span>
