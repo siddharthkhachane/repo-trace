@@ -17,6 +17,17 @@ const askBtn = document.getElementById('askBtn');
 const stopBtn = document.getElementById('stopBtn');
 const themeToggle = document.getElementById('themeToggle');
 const exportChatBtn = document.getElementById('exportChatBtn');
+const ttPathInput = document.getElementById('ttPathInput');
+const ttLoadBtn = document.getElementById('ttLoadBtn');
+const ttError = document.getElementById('ttError');
+const ttSlider = document.getElementById('ttSlider');
+const ttTicks = document.getElementById('ttTicks');
+const ttHelper = document.getElementById('ttHelper');
+const ttCodePanel = document.getElementById('ttCodePanel');
+const ttDiffPanel = document.getElementById('ttDiffPanel');
+const ttDiffToggleBtn = document.getElementById('ttDiffToggleBtn');
+const ttCard = document.getElementById('ttCard');
+const ttCopyBtn = document.getElementById('ttCopyBtn');
 
 let currentEventSource = null;
 let typewriterTimer = null;
@@ -24,12 +35,24 @@ let typewriterQueue = '';
 let streamingBubble = null;
 let streamingMessageDiv = null;
 let streamingAnswer = '';
+let ttHistory = [];
+let ttActiveIndex = 0;
+let ttSnapshotCache = new Map();
+let ttDiffCache = new Map();
+let ttShowDiff = false;
 
 ingestBtn.addEventListener('click', handleIngest);
 askBtn.addEventListener('click', handleAsk);
 stopBtn.addEventListener('click', stopStreaming);
 themeToggle.addEventListener('click', toggleTheme);
 exportChatBtn.addEventListener('click', exportChatHistory);
+ttLoadBtn.addEventListener('click', loadTimeTravelHistory);
+ttSlider.addEventListener('input', handleTimeTravelSliderInput);
+ttDiffToggleBtn.addEventListener('click', toggleTimeTravelDiff);
+ttCopyBtn.addEventListener('click', copySnapshot);
+ttPathInput.addEventListener('keypress', (e) => {
+  if (e.key === 'Enter') loadTimeTravelHistory();
+});
 questionInput.addEventListener('keypress', (e) => {
   if (e.key === 'Enter' && e.ctrlKey && !askBtn.disabled) {
     handleAsk();
@@ -831,6 +854,268 @@ function exportChatHistory() {
     exportChatBtn.textContent = originalText;
     exportChatBtn.disabled = false;
   }, 2000);
+}
+
+function debounce(fn, delay = 120) {
+  let timer = null;
+  return (...args) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), delay);
+  };
+}
+
+function showTimeTravelError(message) {
+  if (!ttError) return;
+  ttError.style.display = 'block';
+  ttError.textContent = message;
+}
+
+function clearTimeTravelError() {
+  if (!ttError) return;
+  ttError.style.display = 'none';
+  ttError.textContent = '';
+}
+
+function skeletonLines(count) {
+  return Array.from({ length: count }).map(() => '<div class="tt-skeleton tt-skeleton-line"></div>').join('');
+}
+
+function setCodeLoading() {
+  ttCodePanel.classList.add('tt-fade');
+  ttCodePanel.innerHTML = skeletonLines(9);
+}
+
+function setCardLoading() {
+  ttCard.classList.add('entering');
+  ttCard.innerHTML = skeletonLines(7);
+}
+
+function renderTimeTravelTicks() {
+  ttTicks.innerHTML = '';
+  if (!ttHistory.length) return;
+  const ticksToShow = 6;
+  const maxIdx = ttHistory.length - 1;
+  const chosen = new Set([0, maxIdx]);
+  for (let i = 1; i < ticksToShow - 1; i += 1) {
+    const idx = Math.min(maxIdx, Math.round((i * maxIdx) / (ticksToShow - 1)));
+    chosen.add(idx);
+  }
+  Array.from(chosen).sort((a, b) => a - b).forEach((idx) => {
+    const chapter = ttHistory[idx];
+    const tick = document.createElement('div');
+    tick.className = 'tt-tick';
+    tick.title = `${chapter.title} (${(chapter.hash || '').slice(0, 7)})`;
+    tick.textContent = chapter.title;
+    ttTicks.appendChild(tick);
+  });
+}
+
+function updateTimeTravelHelper(index) {
+  if (!ttHistory.length) {
+    ttHelper.textContent = 'Load a path to explore its evolution.';
+    return;
+  }
+  const chapter = ttHistory[index];
+  const date = chapter?.date ? new Date(chapter.date).toLocaleDateString() : 'n/a';
+  ttHelper.textContent = `Viewing chapter ${index + 1} of ${ttHistory.length} · ${date} · ${chapter.title}`;
+}
+
+async function loadTimeTravelHistory() {
+  clearTimeTravelError();
+  const path = normalizeTimeTravelPath(ttPathInput.value || '');
+  if (!path) {
+    showTimeTravelError('Enter a file path first.');
+    return;
+  }
+  ttPathInput.value = path;
+  ttLoadBtn.disabled = true;
+  ttSlider.disabled = true;
+  ttHelper.textContent = 'Loading timeline...';
+  ttTicks.innerHTML = '';
+  try {
+    const base = `${CONFIG.API_BASE}/api/time-travel/history?path=${encodeURIComponent(path)}`;
+    const res = await fetch(withRepoId(base));
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    if (!Array.isArray(data) || data.length === 0) {
+      throw new Error('No chapter history found for that path.');
+    }
+    ttHistory = data;
+    ttActiveIndex = data.length - 1;
+    ttSnapshotCache = new Map();
+    ttDiffCache = new Map();
+    ttSlider.min = '0';
+    ttSlider.max = String(data.length - 1);
+    ttSlider.value = String(ttActiveIndex);
+    ttSlider.disabled = false;
+    renderTimeTravelTicks();
+    updateTimeTravelHelper(ttActiveIndex);
+    await loadTimeTravelChapter(ttActiveIndex);
+  } catch (error) {
+    showTimeTravelError(error.message || 'Failed to load timeline');
+    ttHelper.textContent = 'Timeline load failed.';
+  } finally {
+    ttLoadBtn.disabled = false;
+  }
+}
+
+const debouncedLoadChapter = debounce((index) => {
+  loadTimeTravelChapter(index);
+}, 120);
+
+function handleTimeTravelSliderInput() {
+  const index = Number(ttSlider.value || 0);
+  ttActiveIndex = index;
+  updateTimeTravelHelper(index);
+  debouncedLoadChapter(index);
+}
+
+function getSnapshotCacheKey(path, hash) {
+  return `${path}::${hash}`;
+}
+
+function getDiffCacheKey(path, fromHash, toHash) {
+  return `${path}::${fromHash}->${toHash}`;
+}
+
+function normalizeTimeTravelPath(input) {
+  const raw = (input || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    if (u.hostname.endsWith('github.com')) {
+      const parts = u.pathname.split('/').filter(Boolean);
+      if (parts.length >= 5 && parts[2] === 'blob') {
+        return parts.slice(4).join('/');
+      }
+      if (parts.length >= 3) {
+        return parts.slice(2).join('/');
+      }
+    }
+  } catch (error) {
+    // Not a URL, keep original text.
+  }
+  return raw.replace(/\\/g, '/').replace(/^\.\/+/, '');
+}
+
+function withRepoId(url) {
+  if (!currentRepoId) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}repo_id=${encodeURIComponent(currentRepoId)}`;
+}
+
+async function getSnapshot(path, hash) {
+  const key = getSnapshotCacheKey(path, hash);
+  if (ttSnapshotCache.has(key)) return ttSnapshotCache.get(key);
+  const base = `${CONFIG.API_BASE}/api/time-travel/snapshot?path=${encodeURIComponent(path)}&commit=${encodeURIComponent(hash)}`;
+  const res = await fetch(withRepoId(base));
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  ttSnapshotCache.set(key, data);
+  return data;
+}
+
+async function getDiffAndEvolution(path, fromHash, toHash, chapterTitle) {
+  const key = getDiffCacheKey(path, fromHash, toHash);
+  if (ttDiffCache.has(key)) return ttDiffCache.get(key);
+  const base = `${CONFIG.API_BASE}/api/time-travel/diff?path=${encodeURIComponent(path)}&from=${encodeURIComponent(fromHash)}&to=${encodeURIComponent(toHash)}`;
+  const res = await fetch(withRepoId(base));
+  const data = await res.json();
+  if (!res.ok || data.error) {
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  const payload = {
+    diff: data.diff || '',
+    evolution: data.evolution || {
+      title: chapterTitle || 'Evolution chapter',
+      whatChanged: ['Diff unavailable'],
+      why: ['Inference not available'],
+      dontBreak: ['Keep behavior consistent'],
+      risk: 'low'
+    }
+  };
+  ttDiffCache.set(key, payload);
+  return payload;
+}
+
+function renderEvolutionCard(evolution) {
+  const risk = (evolution?.risk || 'low').toLowerCase();
+  const whatChanged = Array.isArray(evolution?.whatChanged) ? evolution.whatChanged : [];
+  const why = Array.isArray(evolution?.why) ? evolution.why : [];
+  const dontBreak = Array.isArray(evolution?.dontBreak) ? evolution.dontBreak : [];
+  ttCard.classList.add('entering');
+  ttCard.innerHTML = `
+    <span class="tt-risk ${risk}">Risk: ${risk}</span>
+    <h3>${evolution?.title || 'Evolution chapter'}</h3>
+    <h3>What changed</h3>
+    <ul>${whatChanged.map((x) => `<li>${x}</li>`).join('')}</ul>
+    <h3>Why</h3>
+    <ul>${why.map((x) => `<li>${x}</li>`).join('')}</ul>
+    <h3>Don't break</h3>
+    <ul>${dontBreak.map((x) => `<li>${x}</li>`).join('')}</ul>
+  `;
+  requestAnimationFrame(() => ttCard.classList.remove('entering'));
+}
+
+async function loadTimeTravelChapter(index) {
+  if (!ttHistory.length) return;
+  clearTimeTravelError();
+  const chapter = ttHistory[index];
+  const path = (ttPathInput.value || '').trim();
+  if (!chapter || !path) return;
+
+  const prev = ttHistory[Math.max(0, index - 1)];
+  setCodeLoading();
+  setCardLoading();
+  try {
+    const [snapshot, diffPack] = await Promise.all([
+      getSnapshot(path, chapter.hash),
+      getDiffAndEvolution(path, prev.hash, chapter.hash, chapter.title)
+    ]);
+
+    ttCodePanel.textContent = snapshot.content || '';
+    ttCodePanel.classList.remove('tt-fade');
+    ttDiffPanel.textContent = diffPack.diff || '';
+    renderEvolutionCard(diffPack.evolution || {});
+    if (!ttShowDiff) {
+      ttDiffPanel.style.display = 'none';
+      ttDiffToggleBtn.textContent = 'Show Diff';
+    }
+  } catch (error) {
+    showTimeTravelError(error.message || 'Unable to load chapter');
+    ttCodePanel.classList.remove('tt-fade');
+    ttCodePanel.textContent = 'Failed to load snapshot.';
+    ttDiffPanel.textContent = '';
+    renderEvolutionCard({
+      title: chapter.title || 'Evolution chapter',
+      whatChanged: ['No chapter data available.'],
+      why: ['Server returned an error.'],
+      dontBreak: ['Retry with a valid text file path.'],
+      risk: 'medium'
+    });
+  }
+}
+
+function toggleTimeTravelDiff() {
+  ttShowDiff = !ttShowDiff;
+  ttDiffPanel.style.display = ttShowDiff ? 'block' : 'none';
+  ttDiffToggleBtn.textContent = ttShowDiff ? 'Hide Diff' : 'Show Diff';
+}
+
+async function copySnapshot() {
+  try {
+    await navigator.clipboard.writeText(ttCodePanel.textContent || '');
+    const original = ttCopyBtn.textContent;
+    ttCopyBtn.textContent = 'Copied';
+    setTimeout(() => {
+      ttCopyBtn.textContent = original;
+    }, 1200);
+  } catch (error) {
+    showTimeTravelError('Copy failed');
+  }
 }
 
 console.log(`Repo-Trace frontend initialized. API Base: ${CONFIG.API_BASE}`);

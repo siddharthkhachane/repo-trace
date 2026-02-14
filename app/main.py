@@ -1,12 +1,15 @@
 import json
 import os
 import uuid
+import re
+import subprocess
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List, Set
 from datetime import datetime
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, BackgroundTasks, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, BackgroundTasks, Request, Query
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -975,6 +978,346 @@ def get_repo_stats(repo_id: str):
     if not stats:
         return {"error": "Stats not available yet"}
     return stats
+
+
+TIME_TRAVEL_KEYWORDS = {
+    "hotfix": re.compile(r"\b(hotfix|fix|bug|bugfix|revert)\b", re.IGNORECASE),
+    "refactor": re.compile(r"\b(refactor|cleanup|rewrite)\b", re.IGNORECASE),
+    "perf": re.compile(r"\b(perf|performance|optimiz|speed|latency)\b", re.IGNORECASE),
+    "test": re.compile(r"\b(test|spec|assert|coverage)\b", re.IGNORECASE),
+    "feature_add": re.compile(r"\b(feature|feat|add|introduce|implement)\b", re.IGNORECASE),
+}
+TIME_TRAVEL_SIGNAL_PATTERN = re.compile(
+    r"(fix|bug|hotfix|revert|refactor|perf|timeout|retry|race|deadlock|sync|reconnect)",
+    re.IGNORECASE,
+)
+TIME_TRAVEL_FILE_LIMIT_BYTES = 1_000_000
+
+
+def _open_workspace_repo() -> git.Repo:
+    try:
+        return git.Repo(Path.cwd(), search_parent_directories=True)
+    except Exception as exc:
+        raise RuntimeError("No git repository found in current workspace.") from exc
+
+
+def _open_target_repo(repo_id: Optional[str] = None) -> git.Repo:
+    if repo_id:
+        candidate = REPOS_DIR / repo_id
+        if not candidate.exists():
+            raise RuntimeError(f"Repository not found for repo_id '{repo_id}'")
+        try:
+            return git.Repo(candidate)
+        except Exception as exc:
+            raise RuntimeError(f"Invalid git repository for repo_id '{repo_id}'") from exc
+    return _open_workspace_repo()
+
+
+def _extract_repo_relative_path(raw_path: str) -> str:
+    value = (raw_path or "").strip()
+    if not value:
+        return value
+    if not value.startswith("http://") and not value.startswith("https://"):
+        return value
+    parsed = urlparse(value)
+    if not parsed.netloc.lower().endswith("github.com"):
+        return value
+    parts = [p for p in parsed.path.split("/") if p]
+    # github.com/{owner}/{repo}/blob/{branch}/path/to/file
+    if len(parts) >= 5 and parts[2] == "blob":
+        return "/".join(parts[4:])
+    # github.com/{owner}/{repo}/path/to/file
+    if len(parts) >= 3:
+        return "/".join(parts[2:])
+    return value
+
+
+def _normalize_repo_path(raw_path: str) -> str:
+    candidate = _extract_repo_relative_path(raw_path).replace("\\", "/")
+    while candidate.startswith("./"):
+        candidate = candidate[2:]
+    if not candidate:
+        raise ValueError("Path is required")
+    if candidate.startswith("/"):
+        raise ValueError("Path must be relative to repository root")
+    normalized = Path(candidate)
+    if any(part == ".." for part in normalized.parts):
+        raise ValueError("Path cannot contain '..'")
+    clean_parts = [part for part in normalized.parts if part not in ("", ".")]
+    if not clean_parts:
+        raise ValueError("Invalid path")
+    return "/".join(clean_parts)
+
+
+def _run_git_bytes(repo: git.Repo, args: List[str]) -> bytes:
+    repo_root = repo.working_tree_dir or str(Path.cwd())
+    proc = subprocess.run(
+        ["git", "-C", repo_root] + args,
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(stderr or "git command failed")
+    return proc.stdout
+
+
+def _chapter_tags(message: str) -> List[str]:
+    tags: List[str] = []
+    for tag, pattern in TIME_TRAVEL_KEYWORDS.items():
+        if pattern.search(message):
+            tags.append(tag)
+    if not tags and TIME_TRAVEL_SIGNAL_PATTERN.search(message):
+        tags.append("bugfix")
+    if not tags:
+        tags.append("feature_add")
+    return tags[:3]
+
+
+def _chapter_title(message: str, tags: List[str]) -> str:
+    clean = re.sub(r"\s+", " ", (message or "").strip())
+    short = clean[:56].strip() if clean else "Repository change"
+    if len(clean) > 56:
+        short += "..."
+    if "hotfix" in tags:
+        return f"Hotfix: {short}"
+    if "refactor" in tags:
+        return f"Refactor: {short}"
+    if "perf" in tags:
+        return f"Performance: {short}"
+    if "test" in tags:
+        return f"Testing: {short}"
+    return f"Feature added: {short}"
+
+
+def _parse_history_records(raw_log: str) -> List[Dict[str, str]]:
+    entries: List[Dict[str, str]] = []
+    for chunk in raw_log.split("\x1e"):
+        item = chunk.strip()
+        if not item:
+            continue
+        parts = item.split("\x1f")
+        if len(parts) < 4:
+            continue
+        entries.append(
+            {
+                "hash": parts[0].strip(),
+                "date": parts[1].strip(),
+                "author": parts[2].strip(),
+                "message": parts[3].strip(),
+            }
+        )
+    return entries
+
+
+def _build_time_travel_chapters(commits: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    if not commits:
+        return []
+    if len(commits) <= 30:
+        selected_indexes = set(range(len(commits)))
+    else:
+        selected_indexes: Set[int] = {0, len(commits) - 1}
+        scored_signals: List[Tuple[float, int]] = []
+        for i, commit in enumerate(commits):
+            message = commit.get("message", "")
+            tags = _chapter_tags(message)
+            has_signal = bool(TIME_TRAVEL_SIGNAL_PATTERN.search(message))
+            if not has_signal:
+                continue
+            score = 10.0 if has_signal else 0.0
+            score += 3.0 if "hotfix" in tags else 0.0
+            score += 2.0 if "refactor" in tags else 0.0
+            score += 1.0 if "perf" in tags else 0.0
+            # Keep slightly newer commits when scores tie.
+            score += max(0.0, 1.0 - (i / max(len(commits) - 1, 1)))
+            scored_signals.append((score, i))
+        for _, idx in sorted(scored_signals, reverse=True):
+            if len(selected_indexes) >= 30:
+                break
+            selected_indexes.add(idx)
+
+        if len(selected_indexes) < 30:
+            remaining = [i for i in range(len(commits)) if i not in selected_indexes]
+            need = 30 - len(selected_indexes)
+            if remaining and need > 0:
+                step = len(remaining) / float(need)
+                chosen: Set[int] = set()
+                for n in range(need):
+                    pos = int(round(n * step))
+                    pos = min(pos, len(remaining) - 1)
+                    chosen.add(remaining[pos])
+                selected_indexes.update(chosen)
+
+    # commits are newest -> oldest, convert to oldest -> newest
+    timeline_indexes = sorted(selected_indexes, reverse=True)
+    chapters: List[Dict[str, Any]] = []
+    for idx in timeline_indexes:
+        commit = commits[idx]
+        message = commit.get("message", "")
+        tags = _chapter_tags(message)
+        chapters.append(
+            {
+                "hash": commit.get("hash", ""),
+                "date": commit.get("date", ""),
+                "author": commit.get("author", "Unknown"),
+                "message": message,
+                "title": _chapter_title(message, tags),
+                "tags": tags,
+            }
+        )
+    return chapters
+
+
+def _build_evolution_card(diff_text: str, commit_message: str, path: str) -> Dict[str, Any]:
+    lines = diff_text.splitlines()
+    added = [ln[1:] for ln in lines if ln.startswith("+") and not ln.startswith("+++")]
+    removed = [ln[1:] for ln in lines if ln.startswith("-") and not ln.startswith("---")]
+    changed_lines = len(added) + len(removed)
+
+    lowered_added = "\n".join(added).lower()
+    lowered_message = (commit_message or "").lower()
+    tests_touched = bool(re.search(r"(test|spec)", path, re.IGNORECASE)) or bool(
+        re.search(r"(test|spec|assert)", lowered_added)
+    )
+    touches_config = bool(re.search(r"(env|config|flag|setting)", lowered_added))
+    has_retry_timeout = bool(re.search(r"(retry|timeout|backoff|reconnect)", lowered_added))
+    has_locking = bool(re.search(r"(lock|mutex|race|deadlock|synchron)", lowered_added))
+
+    what_changed: List[str] = []
+    if changed_lines == 0:
+        what_changed.append("No textual delta detected for this path between selected chapters.")
+    else:
+        what_changed.append(f"Updated `{path}` with {len(added)} additions and {len(removed)} removals.")
+    if has_retry_timeout:
+        what_changed.append("Reliability logic changed (retry/timeout/reconnect signals detected).")
+    if touches_config:
+        what_changed.append("Configuration or environment-sensitive behavior appears to be adjusted.")
+    if tests_touched:
+        what_changed.append("Testing-related code paths or assertions were touched.")
+    if len(what_changed) < 2:
+        what_changed.append("Code structure and logic were adjusted in this chapter transition.")
+
+    why: List[str] = []
+    if re.search(r"(fix|bug|hotfix|revert)", lowered_message):
+        why.append("Likely shipped to resolve a functional bug or regression.")
+    if re.search(r"(refactor|cleanup|rewrite)", lowered_message):
+        why.append("Likely focused on code maintainability and simplification.")
+    if re.search(r"(perf|latency|optimiz|speed)", lowered_message):
+        why.append("Likely intended to improve runtime performance.")
+    if not why:
+        why.append("Commit intent inferred from diff shape and commit metadata.")
+
+    dont_break: List[str] = ["Preserve API behavior expected by existing callers."]
+    if has_retry_timeout:
+        dont_break.append("Do not alter retry/timeout semantics without end-to-end verification.")
+    if has_locking:
+        dont_break.append("Keep synchronization ordering stable to avoid races/deadlocks.")
+    if tests_touched:
+        dont_break.append("Keep test fixtures and assertions aligned with runtime behavior.")
+    if touches_config:
+        dont_break.append("Validate default config/env values before releasing.")
+
+    risk = "low"
+    if changed_lines > 220 or has_locking:
+        risk = "high"
+    elif changed_lines > 80 or has_retry_timeout or touches_config:
+        risk = "medium"
+
+    tags = _chapter_tags(commit_message)
+    title = _chapter_title(commit_message, tags)
+    return {
+        "title": title,
+        "whatChanged": what_changed[:3],
+        "why": why[:2],
+        "dontBreak": dont_break[:3],
+        "risk": risk,
+    }
+
+
+@app.get("/api/time-travel/history")
+def get_time_travel_history(path: str, repo_id: Optional[str] = None):
+    try:
+        repo = _open_target_repo(repo_id)
+        rel_path = _normalize_repo_path(path)
+        fmt = "%H%x1f%aI%x1f%an%x1f%s%x1e"
+        try:
+            raw = repo.git.log("--follow", "--date=iso-strict", f"--pretty=format:{fmt}", "--", rel_path)
+        except git.GitCommandError:
+            raw = repo.git.log("--date=iso-strict", f"--pretty=format:{fmt}", "--", rel_path)
+        commits = _parse_history_records(raw)
+        chapters = _build_time_travel_chapters(commits)
+        return chapters[:30]
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except RuntimeError as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+    except git.GitCommandError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc) or "No history found for path"})
+
+
+@app.get("/api/time-travel/snapshot")
+def get_time_travel_snapshot(path: str, commit: str, repo_id: Optional[str] = None):
+    try:
+        repo = _open_target_repo(repo_id)
+        rel_path = _normalize_repo_path(path)
+        commit_hash = (commit or "").strip()
+        if not commit_hash:
+            raise ValueError("commit is required")
+        spec = f"{commit_hash}:{rel_path}"
+        size_text = _run_git_bytes(repo, ["cat-file", "-s", spec]).decode("utf-8", errors="replace").strip()
+        size_bytes = int(size_text or "0")
+        if size_bytes > TIME_TRAVEL_FILE_LIMIT_BYTES:
+            return JSONResponse(status_code=400, content={"error": "File is too large (limit: 1MB)"})
+        content_bytes = _run_git_bytes(repo, ["show", spec])
+        if b"\x00" in content_bytes:
+            return JSONResponse(status_code=400, content={"error": "Binary files are not supported"})
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return JSONResponse(status_code=400, content={"error": "Binary or non-UTF8 file is not supported"})
+        return {"content": content, "isBinary": False}
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "exists on disk" in message or "does not exist" in message or "path" in message:
+            return JSONResponse(status_code=404, content={"error": "File not found at commit"})
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+    except Exception:
+        return JSONResponse(status_code=404, content={"error": "File not found at commit"})
+
+
+@app.get("/api/time-travel/diff")
+def get_time_travel_diff(
+    path: str,
+    from_hash: str = Query(alias="from"),
+    to_hash: str = Query(alias="to"),
+    repo_id: Optional[str] = None,
+):
+    try:
+        repo = _open_target_repo(repo_id)
+        rel_path = _normalize_repo_path(path)
+        from_commit = (from_hash or "").strip()
+        to_commit = (to_hash or "").strip()
+        if not from_commit or not to_commit:
+            raise ValueError("from_hash and to_hash are required")
+
+        diff_bytes = _run_git_bytes(
+            repo,
+            ["diff", "--no-color", from_commit, to_commit, "--", rel_path],
+        )
+        diff_text = diff_bytes.decode("utf-8", errors="replace")
+        commit_message = ""
+        try:
+            commit_message = repo.commit(to_commit).message.strip()
+        except Exception:
+            commit_message = ""
+        evolution = _build_evolution_card(diff_text, commit_message, rel_path)
+        return {"diff": diff_text, "evolution": evolution}
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except RuntimeError as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
 
 
 @app.post("/ask", response_model=AskResponse)

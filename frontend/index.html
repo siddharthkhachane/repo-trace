@@ -995,6 +995,194 @@
         [data-theme="light"] .theme-icon {
             content: "☀️";
         }
+        .time-travel-section {
+            margin-top: 24px;
+            padding-top: 24px;
+            border-top: 1px solid rgba(139, 92, 246, 0.2);
+        }
+
+        .tt-controls {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 10px;
+            margin-bottom: 14px;
+        }
+
+        .tt-error {
+            margin-bottom: 10px;
+        }
+
+        .tt-slider-wrap {
+            background: rgba(17, 24, 39, 0.5);
+            border: 1px solid rgba(139, 92, 246, 0.2);
+            border-radius: 12px;
+            padding: 14px;
+            margin-bottom: 14px;
+        }
+
+        .tt-helper {
+            font-size: 12px;
+            color: #9ca3af;
+            margin-bottom: 8px;
+        }
+
+        .tt-slider {
+            width: 100%;
+            accent-color: #8b5cf6;
+            cursor: pointer;
+        }
+
+        .tt-ticks {
+            margin-top: 8px;
+            display: grid;
+            grid-template-columns: repeat(6, minmax(0, 1fr));
+            gap: 8px;
+            font-size: 11px;
+            color: #9ca3af;
+        }
+
+        .tt-tick {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            border-left: 1px solid rgba(139, 92, 246, 0.2);
+            padding-left: 6px;
+        }
+
+        .tt-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+            gap: 14px;
+        }
+
+        .tt-code-shell {
+            background: rgba(17, 24, 39, 0.5);
+            border: 1px solid rgba(139, 92, 246, 0.2);
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        .tt-panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px;
+            border-bottom: 1px solid rgba(139, 92, 246, 0.2);
+            font-size: 12px;
+            color: #9ca3af;
+        }
+
+        .tt-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .tt-small-btn {
+            padding: 7px 10px;
+            border-radius: 8px;
+            font-size: 12px;
+        }
+
+        .tt-code-panel,
+        .tt-diff-panel {
+            min-height: 260px;
+            max-height: 420px;
+            overflow: auto;
+            padding: 12px;
+            font-family: 'Fira Code', 'Monaco', 'Consolas', monospace;
+            font-size: 12px;
+            line-height: 1.45;
+            white-space: pre;
+            transition: opacity 180ms ease;
+        }
+
+        .tt-fade {
+            opacity: 0.2;
+        }
+
+        .tt-diff-panel {
+            display: none;
+            border-top: 1px solid rgba(139, 92, 246, 0.2);
+            background: rgba(10, 14, 33, 0.35);
+        }
+
+        .tt-card {
+            background: rgba(17, 24, 39, 0.5);
+            border: 1px solid rgba(139, 92, 246, 0.2);
+            border-radius: 12px;
+            padding: 14px;
+            min-height: 260px;
+            transition: transform 180ms ease, opacity 180ms ease;
+        }
+
+        .tt-card.entering {
+            opacity: 0;
+            transform: translateX(8px);
+        }
+
+        .tt-risk {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            margin-bottom: 10px;
+        }
+
+        .tt-risk.low {
+            background: rgba(16, 185, 129, 0.15);
+            color: #6ee7b7;
+        }
+
+        .tt-risk.medium {
+            background: rgba(245, 158, 11, 0.16);
+            color: #fcd34d;
+        }
+
+        .tt-risk.high {
+            background: rgba(239, 68, 68, 0.16);
+            color: #fca5a5;
+        }
+
+        .tt-card h3 {
+            font-size: 14px;
+            margin-bottom: 8px;
+            color: #d1d5db;
+        }
+
+        .tt-card ul {
+            margin: 0 0 10px 18px;
+            color: #d1d5db;
+            font-size: 12px;
+        }
+
+        .tt-card li {
+            margin-bottom: 6px;
+        }
+
+        .tt-skeleton {
+            background: linear-gradient(90deg, rgba(139, 92, 246, 0.09), rgba(139, 92, 246, 0.22), rgba(139, 92, 246, 0.09));
+            background-size: 200% 100%;
+            animation: ttShimmer 1s linear infinite;
+            border-radius: 8px;
+        }
+
+        .tt-skeleton-line {
+            height: 10px;
+            margin-bottom: 8px;
+        }
+
+        @keyframes ttShimmer {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        @media (max-width: 1100px) {
+            .tt-grid {
+                grid-template-columns: 1fr;
+            }
+        }
     </style>
 </head>
 <body>
@@ -1087,6 +1275,38 @@
                         <button id="stopBtn" class="stop-btn" disabled>
                             Stop
                         </button>
+                    </div>
+                </div>
+
+                <div class="section time-travel-section">
+                    <h2>Time Travel</h2>
+                    <div class="tt-controls">
+                        <input id="ttPathInput" type="text" placeholder="Path in repo (e.g., app/main.py)" />
+                        <button id="ttLoadBtn">Load Timeline</button>
+                    </div>
+                    <div id="ttError" class="error-message tt-error" style="display:none;"></div>
+                    <div class="tt-slider-wrap">
+                        <div id="ttHelper" class="tt-helper">Load a path to explore its evolution.</div>
+                        <input id="ttSlider" class="tt-slider" type="range" min="0" max="0" step="1" value="0" disabled />
+                        <div id="ttTicks" class="tt-ticks"></div>
+                    </div>
+                    <div class="tt-grid">
+                        <div class="tt-code-shell">
+                            <div class="tt-panel-header">
+                                <span>Code Snapshot</span>
+                                <div class="tt-actions">
+                                    <button id="ttCopyBtn" class="tt-small-btn">Copy</button>
+                                    <button id="ttDiffToggleBtn" class="tt-small-btn">Show Diff</button>
+                                </div>
+                            </div>
+                            <pre id="ttCodePanel" class="tt-code-panel">No snapshot loaded.</pre>
+                            <pre id="ttDiffPanel" class="tt-diff-panel"></pre>
+                        </div>
+                        <div id="ttCard" class="tt-card">
+                            <span class="tt-risk low">Risk: low</span>
+                            <h3>Evolution Card</h3>
+                            <ul><li>Load a chapter to see what changed.</li></ul>
+                        </div>
                     </div>
                 </div>
             </div>
