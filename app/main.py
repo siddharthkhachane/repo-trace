@@ -1168,6 +1168,80 @@ def _build_time_travel_chapters(commits: List[Dict[str, str]]) -> List[Dict[str,
     return chapters
 
 
+def _strip_json_fence(text: str) -> str:
+    raw = (text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    return raw.strip()
+
+
+def _normalize_evolution_payload(payload: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
+    def _list_field(key: str, max_items: int) -> List[str]:
+        value = payload.get(key)
+        if not isinstance(value, list):
+            return list(fallback.get(key, []))[:max_items]
+        cleaned: List[str] = []
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                cleaned.append(text)
+        return (cleaned or list(fallback.get(key, [])))[:max_items]
+
+    risk_raw = str(payload.get("risk") or "").strip().lower()
+    risk = risk_raw if risk_raw in {"low", "medium", "high"} else str(fallback.get("risk", "medium"))
+    title = str(payload.get("title") or "").strip() or str(fallback.get("title", "Evolution chapter"))
+    return {
+        "title": title,
+        "whatChanged": _list_field("whatChanged", 4),
+        "why": _list_field("why", 3),
+        "dontBreak": _list_field("dontBreak", 4),
+        "risk": risk,
+    }
+
+
+def _build_evolution_card_with_llm(
+    diff_text: str,
+    commit_message: str,
+    path: str,
+    fallback: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if _openai_client is None:
+        return None
+
+    system_prompt = (
+        "Generate an engineering evolution card from git changes. "
+        "Return JSON only with keys: title, whatChanged, why, dontBreak, risk. "
+        "risk must be exactly one of low, medium, high. "
+        "Use concise, concrete bullets grounded in the diff."
+    )
+    payload = {
+        "path": path,
+        "commit_message": commit_message,
+        "diff_excerpt": diff_text[:12000],
+        "fallback": fallback,
+    }
+
+    try:
+        resp = _openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.1,
+        )
+        raw = ""
+        if resp.choices and resp.choices[0].message:
+            raw = str(resp.choices[0].message.content or "")
+        parsed = json.loads(_strip_json_fence(raw))
+        if not isinstance(parsed, dict):
+            return None
+        return _normalize_evolution_payload(parsed, fallback)
+    except Exception:
+        return None
+
+
 def _build_evolution_card(diff_text: str, commit_message: str, path: str) -> Dict[str, Any]:
     lines = diff_text.splitlines()
     added = [ln[1:] for ln in lines if ln.startswith("+") and not ln.startswith("+++")]
@@ -1313,6 +1387,9 @@ def get_time_travel_diff(
         except Exception:
             commit_message = ""
         evolution = _build_evolution_card(diff_text, commit_message, rel_path)
+        llm_evolution = _build_evolution_card_with_llm(diff_text, commit_message, rel_path, evolution)
+        if llm_evolution:
+            evolution = llm_evolution
         return {"diff": diff_text, "evolution": evolution}
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
